@@ -1,4 +1,4 @@
-﻿from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback
 from email.message import EmailMessage
 
@@ -49,6 +49,30 @@ def ensure_alerts_schema():
     conn.close()
 
 ensure_alerts_schema()
+
+# ---------- Server Status Schema ----------
+def ensure_server_status_schema():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS server_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            cpu_usage REAL,
+            memory_usage REAL,
+            total_disk REAL,
+            used_disk REAL,
+            disk_percent REAL,
+            last_updated TEXT,
+            FOREIGN KEY(server_id) REFERENCES servers(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+ensure_server_status_schema()
 
 # ---------- Auth & RBAC Helpers ----------
 def get_current_user():
@@ -975,6 +999,134 @@ def server_history():
     conn.close()
     
     return render_template('server_history.html', records=history_records)
+
+# ---------- Server Metrics APIs ----------
+@app.route('/api/server-metrics', methods=['GET'])
+@login_required
+def api_server_metrics():
+    """Collect metrics for a server (local collection only) and persist to server_status.
+    Query params: server_id (preferred) or ip
+    Returns JSON with metrics or error.
+    """
+    user = get_current_user()
+    server_id = request.args.get('server_id', type=int)
+    ip = request.args.get('ip', type=str)
+
+    if not server_id and not ip:
+        return jsonify({"error": "server_id or ip is required"}), 400
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    row = None
+    if server_id:
+        c.execute("SELECT id, name, ip_address, location FROM servers WHERE id=?", (server_id,))
+        row = c.fetchone()
+    elif ip:
+        c.execute("SELECT id, name, ip_address, location FROM servers WHERE ip_address=?", (ip,))
+        row = c.fetchone()
+
+    if not row:
+        conn.close()
+        return jsonify({"error": "server not found"}), 404
+
+    # RBAC: Admin/Analytics limited to their location
+    if not user_can_access_location(user, row["location"]):
+        conn.close()
+        return jsonify({"error": "access denied for this location"}), 403
+
+    # Only collect metrics from local host. If target is not the current machine, return error.
+    target_ip = row["ip_address"]
+    local_hostnames = {platform.node().lower(), socket.gethostname().lower()}
+    local_ips = {"127.0.0.1", "::1"}
+    # Attempt to add local network IPs
+    try:
+        local_ips.add(socket.gethostbyname(socket.gethostname()))
+    except Exception:
+        pass
+
+    if target_ip not in local_ips and target_ip.lower() not in local_hostnames:
+        conn.close()
+        return jsonify({"error": "remote collection not supported from this node"}), 502
+
+    try:
+        cpu_usage = psutil.cpu_percent(interval=0.5)
+        mem = psutil.virtual_memory()
+        # Resolve disk root like earlier logic
+        try:
+            disk_root = os.environ.get("DISK_ROOT") or os.getenv('SystemDrive') or os.path.abspath(os.sep)
+            if isinstance(disk_root, bytes):
+                disk_root = disk_root.decode('utf-8', 'ignore')
+            disk_root = (disk_root or '').strip()
+            if platform.system().lower().startswith('win') and len(disk_root) == 2 and disk_root[1] == ':':
+                disk_root = disk_root + '\\'
+            disk_root = os.path.normpath(disk_root)
+            if not os.path.isabs(disk_root):
+                disk_root = os.path.abspath(disk_root)
+            disk_usage = psutil.disk_usage(disk_root)
+        except Exception:
+            disk_usage = psutil.disk_usage(os.path.abspath(os.sep))
+
+        total_disk_gb = round(disk_usage.total / (1024**3), 2)
+        used_disk_gb = round(disk_usage.used / (1024**3), 2)
+        disk_percent = round((disk_usage.used / disk_usage.total) * 100, 2) if disk_usage.total else 0.0
+
+        now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+        c.execute(
+            """
+            INSERT INTO server_status (server_id, cpu_usage, memory_usage, total_disk, used_disk, disk_percent, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (row["id"], cpu_usage, mem.percent, total_disk_gb, used_disk_gb, disk_percent, now)
+        )
+        conn.commit()
+        resp = {
+            "server_id": row["id"],
+            "name": row["name"],
+            "ip_address": row["ip_address"],
+            "cpu_usage": cpu_usage,
+            "memory_usage": mem.percent,
+            "total_disk": total_disk_gb,
+            "used_disk": used_disk_gb,
+            "disk_percent": disk_percent,
+            "last_updated": now,
+        }
+        conn.close()
+        return jsonify(resp)
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": f"metrics_collection_failed: {type(e).__name__}: {e}"}), 500
+
+
+@app.route('/api/server-status/latest')
+@login_required
+def api_server_status_latest():
+    """Return latest server_status per server, with RBAC filtering."""
+    user = get_current_user()
+    conn = get_db_connection()
+    c = conn.cursor()
+    # Base: latest status per server
+    base_sql = """
+        SELECT s.id as server_id, s.name, s.ip_address, s.location,
+               st.cpu_usage, st.memory_usage, st.total_disk, st.used_disk, st.disk_percent, st.last_updated
+        FROM servers s
+        LEFT JOIN (
+            SELECT t1.* FROM server_status t1
+            JOIN (
+                SELECT server_id, MAX(last_updated) as max_ts
+                FROM server_status
+                GROUP BY server_id
+            ) t2 ON t1.server_id = t2.server_id AND t1.last_updated = t2.max_ts
+        ) st ON st.server_id = s.id
+    """
+    params = []
+    if user and user["role"] in ("admin", "analytics"):
+        base_sql += " WHERE LOWER(s.location)=LOWER(?)"
+        params.append(user["location"] or "")
+    base_sql += " ORDER BY s.name"
+    c.execute(base_sql, params)
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return jsonify({"server_status": rows})
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

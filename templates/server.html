@@ -164,7 +164,28 @@
                         {% endfor %}
                 </table>
             </div>
-    </div>
+        </div>
+
+        <div class="card">
+            <h2>Server Status</h2>
+            <div class="table-container">
+                <table id="server-status-table">
+                    <thead>
+                        <tr>
+                            <th>Server</th>
+                            <th>CPU Usage</th>
+                            <th>Memory Usage</th>
+                            <th>Total Disk (GB)</th>
+                            <th>Used Disk (GB)</th>
+                            <th>Disk %</th>
+                            <th>Last Updated</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    </tbody>
+                </table>
+            </div>
+        </div>
     <script>
     // Auto-refresh server statuses every 15 seconds
     async function refreshServers() {
@@ -197,6 +218,41 @@
     setInterval(refreshServers, 15000);
     // Initial load
     refreshServers();
+
+    // Auto-refresh latest server metrics every 12 seconds
+    async function refreshServerStatus() {
+        try {
+            const res = await fetch('/api/server-status/latest', { credentials: 'same-origin' });
+            if (!res.ok) return;
+            const data = await res.json();
+            const tbody = document.querySelector('#server-status-table tbody');
+            if (!tbody) return;
+            const rows = (data.server_status || []).map(item => {
+                const cpu = item.cpu_usage == null ? '-' : (item.cpu_usage.toFixed ? item.cpu_usage.toFixed(1) : item.cpu_usage) + '%';
+                const mem = item.memory_usage == null ? '-' : (item.memory_usage.toFixed ? item.memory_usage.toFixed(1) : item.memory_usage) + '%';
+                const tdisk = item.total_disk == null ? '-' : item.total_disk;
+                const udisk = item.used_disk == null ? '-' : item.used_disk;
+                const dpct = item.disk_percent == null ? '-' : (item.disk_percent.toFixed ? item.disk_percent.toFixed(1) : item.disk_percent) + '%';
+                const name = item.name || ('#' + item.server_id);
+                return `
+                    <tr>
+                        <td>${name}</td>
+                        <td>${cpu}</td>
+                        <td>${mem}</td>
+                        <td>${tdisk}</td>
+                        <td>${udisk}</td>
+                        <td>${dpct}</td>
+                        <td>${item.last_updated || '-'}</td>
+                    </tr>
+                `;
+            }).join('');
+            tbody.innerHTML = rows;
+        } catch (e) {
+            // ignore transient errors
+        }
+    }
+    setInterval(refreshServerStatus, 12000);
+    refreshServerStatus();
     </script>
 </body>
 </html>
