@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Server Monitoring</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Server Monitoring Dashboard</h1>
+        </div>
+    </header>
+
+    <nav>
+        <div class="container">
+            <ul>
+                <li><a href="/">Dashboard</a></li>
+                <li><a href="/domain">Domain Monitoring</a></li>
+                <li><a href="/server">Server Info</a></li>
+                <li><a href="/server/history">Server History</a></li>
+                <li><a href="/run_alerts">Run Alerts</a></li>
+                {% if user %}
+                    <li style="margin-left:auto"><a href="/logout">Logout ({{ user.name }})</a></li>
+                {% else %}
+                    <li style="margin-left:auto"><a href="/login">Login</a></li>
+                {% endif %}
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert alert-{{ category }}">
+                <strong>{{ category.title() }}:</strong> {{ message }}
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+        <div class="card">
+            <h2>Add Server</h2>
+            <form method="POST" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                <input type="text" name="name" placeholder="Server name" class="form-control" required style="min-width:180px;">
+                <input type="text" name="ip_address" placeholder="IP address" class="form-control" required style="min-width:180px;">
+                <select name="location" class="form-control" style="min-width: 180px;">
+                    {% for loc in locations %}
+                        <option value="{{ loc }}">{{ loc }}</option>
+                    {% endfor %}
+                </select>
+                <button type="submit" class="btn btn-primary">Add Server</button>
+            </form>
+        </div>
+        {% if server_info %}
+            {% if server_info.error %}
+                <div class="alert alert-danger">
+                    <strong>Error:</strong> {{ server_info.error }}
+                </div>
+            {% else %}
+                <div class="card">
+                    <h2>Current Server Status</h2>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px;">
+                        <div class="card">
+                            <h3>🖥️ System Information</h3>
+                            <ul style="list-style: none; padding: 0;">
+                                <li><strong>Hostname:</strong> {{ server_info.hostname }}</li>
+                                <li><strong>Operating System:</strong> {{ server_info.os }}</li>
+                                <li><strong>CPU Cores:</strong> {{ server_info.cpu_count }}</li>
+                                <li><strong>Status:</strong> <span class="status-indicator status-online"></span>Online</li>
+                            </ul>
+                        </div>
+
+                        <div class="card">
+                            <h3>⚡ CPU Performance</h3>
+                            <div style="text-align: center; margin: 20px 0;">
+                                <div style="font-size: 2em; font-weight: bold; color: #667eea;">{{ server_info.cpu_usage }}</div>
+                                <div>CPU Usage</div>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <h3>💾 Memory Usage</h3>
+                            <ul style="list-style: none; padding: 0;">
+                                <li><strong>Total:</strong> {{ server_info.memory_total }}</li>
+                                <li><strong>Used:</strong> {{ server_info.memory_used }}</li>
+                                <li><strong>Usage:</strong> {{ server_info.memory_percent }}</li>
+                            </ul>
+                        </div>
+
+                        <div class="card">
+                            <h3>💽 Disk Usage</h3>
+                            <ul style="list-style: none; padding: 0;">
+                                <li><strong>Total:</strong> {{ server_info.disk_total }}</li>
+                                <li><strong>Used:</strong> {{ server_info.disk_used }}</li>
+                                <li><strong>Usage:</strong> {{ server_info.disk_percent }}</li>
+                            </ul>
+                        </div>
+
+                        <div class="card">
+                            <h3>🔌 Network Ports</h3>
+                            <div>
+                                {% if server_info.open_ports %}
+                                    {% for port in server_info.open_ports %}
+                                        <span class="badge badge-success">{{ port }}</span>
+                                    {% endfor %}
+                                {% else %}
+                                    <span class="badge badge-warning">No common ports open</span>
+                                {% endif %}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Quick Actions</h2>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        <a href="/server/history" class="btn btn-primary">View History</a>
+                        <button onclick="location.reload()" class="btn btn-secondary">Refresh Data</button>
+                        <a href="/run_alerts" class="btn btn-success">Run Alerts</a>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Servers</h2>
+                    <div class="table-container" id="servers-table-container">
+                        <table id="servers-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>IP</th>
+                                    <th>Location</th>
+                                    <th>Alive</th>
+                                    <th>Last Ping</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for s in servers %}
+                                <tr data-id="{{ s.id }}">
+                                    <td class="name">{{ s.name }}</td>
+                                    <td class="ip">{{ s.ip_address }}</td>
+                                    <td class="location">{{ s.location or '-' }}</td>
+                                    <td class="alive">
+                                        {% if s.alive %}
+                                            <span class="badge badge-success">Online</span>
+                                        {% else %}
+                                            <span class="badge badge-danger">Offline</span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="last_ping">{{ s.last_ping_at or '-' }}</td>
+                                    <td>
+                                        <a href="/server/ping/{{ s.id }}" class="btn btn-sm btn-secondary">Ping</a>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            {% endif %}
+        {% endif %}
+    </div>
+    <script>
+    // Auto-refresh server statuses every 15 seconds
+    async function refreshServers() {
+        try {
+            const res = await fetch('/api/servers/status', { credentials: 'same-origin' });
+            if (!res.ok) return;
+            const data = await res.json();
+            const rows = document.querySelectorAll('#servers-table tbody tr');
+            const map = new Map();
+            (data.servers || []).forEach(s => map.set(String(s.id), s));
+            rows.forEach(tr => {
+                const id = tr.getAttribute('data-id');
+                const s = map.get(id);
+                if (!s) return;
+                const aliveTd = tr.querySelector('.alive');
+                const lastPingTd = tr.querySelector('.last_ping');
+                if (aliveTd) {
+                    aliveTd.innerHTML = s.alive
+                        ? '<span class="badge badge-success">Online</span>'
+                        : '<span class="badge badge-danger">Offline</span>';
+                }
+                if (lastPingTd) {
+                    lastPingTd.textContent = s.last_ping_at || '-';
+                }
+            });
+        } catch (e) {
+            // ignore transient errors
+        }
+    }
+    setInterval(refreshServers, 15000);
+    </script>
+</body>
+</html>

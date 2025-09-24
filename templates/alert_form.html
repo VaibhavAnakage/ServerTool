@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Configure Alert - {{ domain_name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Domain Alert Configuration</h1>
+        </div>
+    </header>
+
+    <nav>
+        <div class="container">
+            <ul>
+                <li><a href="/">Dashboard</a></li>
+                <li><a href="/domain">Domain Monitoring</a></li>
+                <li><a href="/server">Server Info</a></li>
+                <li><a href="/server/history">Server History</a></li>
+                <li><a href="/run_alerts">Run Alerts</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="card">
+            <h2>Configure Alert for <strong>{{ domain_name }}</strong></h2>
+            <p>Set up email notifications for SSL certificate expiration.</p>
+            
+            <form method="POST">
+                <input type="hidden" name="domain_name" value="{{ domain_name }}">
+                
+                <div class="form-group">
+                    <label for="recipients">Email Recipients:</label>
+                    <input type="email" 
+                           id="recipients" 
+                           name="recipients" 
+                           class="form-control" 
+                           placeholder="admin@example.com, ops@example.com" 
+                           required 
+                           multiple>
+                    <small style="color: #666;">Separate multiple emails with commas</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="days_before">Alert Days Before Expiry:</label>
+                    <select id="days_before" name="days_before" class="form-control">
+                        <option value="7">7 days</option>
+                        <option value="14">14 days</option>
+                        <option value="30" selected>30 days</option>
+                        <option value="60">60 days</option>
+                        <option value="90">90 days</option>
+                        <option value="120">120 days</option>
+                        <option value="150">150 days</option>
+                        <option value="180">180 days</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="frequency">Alert Frequency:</label>
+                    <select id="frequency" name="frequency" class="form-control">
+                        <option value="once">Once</option>
+                        <option value="daily">Daily</option>
+                        <option value="weekly">Weekly</option>
+                        <option value="monthly">Monthly</option>
+                    </select>
+                    <small style="color: #666;">How often to resend alerts after they first become due</small>
+                </div>
+                
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 10px;">
+                        <input type="checkbox" name="send_once" style="transform: scale(1.2);">
+                        <span>Send alert only once (don't repeat)</span>
+                    </label>
+                    <small style="color: #666;">If unchecked, alerts will be sent repeatedly until the certificate is renewed</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="end_date">End Date (optional):</label>
+                    <input type="date" id="end_date" name="end_date" class="form-control">
+                    <small style="color: #666;">Stop sending alerts after this date</small>
+                </div>
+
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 10px;">
+                        <input type="checkbox" name="terminate" style="transform: scale(1.2);">
+                        <span>Terminate/Disable this alert</span>
+                    </label>
+                </div>
+                
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <button type="submit" class="btn btn-primary">Save Alert Configuration</button>
+                    <a href="{{ url_for('domain') }}" class="btn btn-secondary">Cancel</a>
+                </div>
+            </form>
+        </div>
+
+        <div class="card">
+            <h3>Alert Information</h3>
+            <ul style="list-style: none; padding: 0;">
+                <li>📧 <strong>Email Notifications:</strong> Alerts will be sent to the specified recipients</li>
+                <li>⏰ <strong>Timing:</strong> You'll receive notifications based on the days-before setting</li>
+                <li>🔄 <strong>Frequency:</strong> Choose between one-time or recurring alerts</li>
+                <li>✅ <strong>Manual Trigger:</strong> You can manually run alerts from the dashboard</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>

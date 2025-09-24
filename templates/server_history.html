@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Server Monitoring History</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Server Monitoring History</h1>
+        </div>
+    </header>
+
+    <nav>
+        <div class="container">
+            <ul>
+                <li><a href="/">Dashboard</a></li>
+                <li><a href="/domain">Domain Monitoring</a></li>
+                <li><a href="/server">Server Info</a></li>
+                <li><a href="/server/history">Server History</a></li>
+                <li><a href="/run_alerts">Run Alerts</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="card">
+            <h2>Server Performance History</h2>
+            <p>Historical data showing server performance over time (Last 50 records)</p>
+            
+            {% if records %}
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>Hostname</th>
+                                <th>OS</th>
+                                <th>CPU Usage</th>
+                                <th>Memory Usage</th>
+                                <th>Disk Usage</th>
+                                <th>Open Ports</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for record in records %}
+                            <tr>
+                                <td>{{ record.timestamp }}</td>
+                                <td>{{ record.hostname }}</td>
+                                <td>{{ record.os }}</td>
+                                <td>
+                                    <span class="badge {% if (record.cpu_usage|float) > 80 %}badge-danger{% elif (record.cpu_usage|float) > 60 %}badge-warning{% else %}badge-success{% endif %}">
+                                        {{ (record.cpu_usage|float)|round(1) }}%
+                                    </span>
+                                </td>
+                                <td>
+                                    <span class="badge {% if (record.memory_percent|float) > 80 %}badge-danger{% elif (record.memory_percent|float) > 60 %}badge-warning{% else %}badge-success{% endif %}">
+                                        {{ (record.memory_percent|float)|round(1) }}%
+                                    </span>
+                                </td>
+                                <td>
+                                    <span class="badge {% if (record.disk_percent|float) > 80 %}badge-danger{% elif (record.disk_percent|float) > 60 %}badge-warning{% else %}badge-success{% endif %}">
+                                        {{ (record.disk_percent|float)|round(1) }}%
+                                    </span>
+                                </td>
+                                <td>
+                                    {% if record.open_ports %}
+                                        {% for port in record.open_ports.split(',') %}
+                                            <span class="badge badge-info">{{ port }}</span>
+                                        {% endfor %}
+                                    {% else %}
+                                        <span class="badge badge-warning">None</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <span class="status-indicator {% if record.status == 'online' %}status-online{% else %}status-offline{% endif %}"></span>
+                                    {{ record.status.title() }}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% else %}
+                <div class="alert alert-info">
+                    <strong>No data available.</strong> Server monitoring data will appear here once you visit the server info page.
+                </div>
+            {% endif %}
+        </div>
+
+        <div class="card">
+            <h2>Quick Actions</h2>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <a href="/server" class="btn btn-primary">Current Status</a>
+                <button onclick="location.reload()" class="btn btn-secondary">Refresh Data</button>
+                <a href="/" class="btn btn-success">Dashboard</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

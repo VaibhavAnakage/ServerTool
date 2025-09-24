@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Domain Monitoring</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Domain Monitoring Dashboard</h1>
+        </div>
+    </header>
+
+    <nav>
+        <div class="container">
+            <ul>
+                <li><a href="/">Dashboard</a></li>
+                <li><a href="/domain">Domain Monitoring</a></li>
+                <li><a href="/server">Server Info</a></li>
+                <li><a href="/server/history">Server History</a></li>
+                <li><a href="/run_alerts">Run Alerts</a></li>
+                {% if user %}
+                    <li style="margin-left:auto"><a href="/logout">Logout ({{ user.name }})</a></li>
+                {% else %}
+                    <li style="margin-left:auto"><a href="/login">Login</a></li>
+                {% endif %}
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert alert-{{ category }}">
+                <strong>{{ category.title() }}:</strong> {{ message }}
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+
+        <div class="card">
+            <h2>Add New Domain</h2>
+            <form method="POST" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                <input type="text" name="domain_name" placeholder="example.com" required class="form-control" style="flex: 1; min-width: 200px;">
+                <select name="location" class="form-control" style="min-width: 180px;">
+                    {% for loc in locations %}
+                        <option value="{{ loc }}">{{ loc }}</option>
+                    {% endfor %}
+                </select>
+                <button type="submit" class="btn btn-primary">Add Domain</button>
+            </form>
+        </div>
+
+        {% if domains %}
+            <div class="card">
+                <h2>Monitored Domains</h2>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Domain</th>
+                                <th>SSL Issuer</th>
+                                <th>SSL Expiry</th>
+                                <th>Days to Expiry</th>
+                                <th>Location</th>
+                                <th>Alert Configuration</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for d in domains %}
+                            <tr>
+                                <td><strong>{{ d.name }}</strong></td>
+                                <td>{{ d.ssl_issuer or '-' }}</td>
+                                <td>{{ d.ssl_expiry or '-' }}</td>
+                                <td>
+                                    {% if d.days_left is not none %}
+                                        {% if d.days_left < 0 %}
+                                            <span class="badge badge-danger">Expired {{ -d.days_left }} day(s) ago</span>
+                                        {% elif d.days_left <= 30 %}
+                                            <span class="badge badge-warning">{{ d.days_left }} day(s)</span>
+                                        {% else %}
+                                            <span class="badge badge-success">{{ d.days_left }} day(s)</span>
+                                        {% endif %}
+                                    {% else %}
+                                        <span class="badge badge-info">Unknown</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ d.location or '-' }}</td>
+                                <td>
+                                    {% if d.alert_recipients %}
+                                        <div style="font-size: 0.9em;">
+                                            <div><strong>Recipients:</strong> {{ d.alert_recipients }}</div>
+                                            <div><strong>Days before:</strong> {{ d.alert_days_before }}</div>
+                                            <div><strong>Frequency:</strong> {{ d.alert_frequency or 'once' }}</div>
+                                            <div><strong>Send once:</strong> {{ 'Yes' if d.alert_send_once else 'No' }}</div>
+                                            <div><strong>Active:</strong> {{ 'Yes' if d.alert_active else 'No' }}</div>
+                                            {% if d.alert_end_date %}
+                                                <div><strong>Ends:</strong> {{ d.alert_end_date }}</div>
+                                            {% endif %}
+                                            {% if d.alert_last_sent %}
+                                                <div><strong>Last Sent:</strong> {{ d.alert_last_sent }}</div>
+                                            {% endif %}
+                                            <div><strong>Status:</strong> 
+                                                <span class="badge {% if d.alert_sent %}badge-success{% else %}badge-warning{% endif %}">
+                                                    {{ 'Sent' if d.alert_sent else 'Pending' }}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    {% else %}
+                                        <span class="badge badge-info">No alerts configured</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <a href="{{ url_for('alert') }}?domain_name={{ d.name }}" class="btn btn-sm btn-primary">
+                                        {{ 'Edit Alert' if d.alert_recipients else 'Set Alert' }}
+                                    </a>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        {% else %}
+            <div class="card">
+                <div class="alert alert-info">
+                    <strong>No domains configured yet.</strong> Add your first domain above to start monitoring SSL certificates and expiration dates.
+                </div>
+            </div>
+        {% endif %}
+
+        <div class="card">
+            <h2>Quick Actions</h2>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <a href="/server" class="btn btn-secondary">Server Info</a>
+                <a href="/server/history" class="btn btn-secondary">Server History</a>
+                <a href="/run_alerts" class="btn btn-success">Run Alerts Now</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
