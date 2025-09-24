@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+﻿from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback, threading, time
 from email.message import EmailMessage
 
@@ -1311,7 +1311,7 @@ def _start_watcher_once():
         p.start()
         _pinger_thread_started = True
 
-def _background_ping_loop(interval_seconds=3):
+def _background_ping_loop(interval_seconds=10):
     while True:
         try:
             conn = get_db_connection()
