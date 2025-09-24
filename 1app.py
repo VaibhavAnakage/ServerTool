@@ -499,56 +499,10 @@ def server():
         cpu_count = psutil.cpu_count(logical=True)
         cpu_percent = psutil.cpu_percent(interval=1)
         memory = psutil.virtual_memory()
-        # Resolve a clean disk root path with multiple layers of safety
-        try:
-            # 1) Allow override via env
-            disk_root = os.environ.get("DISK_ROOT")
-            # 2) Else prefer Windows system drive, else fallback to '/'
-            if not disk_root:
-                sys_drive = os.getenv('SystemDrive')  # e.g. 'C:'
-                if sys_drive:
-                    disk_root = sys_drive
-                else:
-                    disk_root = os.path.abspath(os.sep)
-
-            # Ensure string type
-            if isinstance(disk_root, bytes):
-                disk_root = disk_root.decode('utf-8', 'ignore')
-            # Strip and normalize
-            disk_root = (disk_root or '').strip()
-            if platform.system().lower().startswith('win'):
-                # Ensure like 'C:\'
-                if len(disk_root) == 2 and disk_root[1] == ':':
-                    disk_root = disk_root + '\\'
-            disk_root = os.path.normpath(disk_root)
-            if not os.path.isabs(disk_root):
-                disk_root = os.path.abspath(disk_root)
-
-            # Debug prints (console) to verify value
-            print("[server] disk_root=", repr(disk_root), type(disk_root))
-
-            disk = psutil.disk_usage(disk_root)
-        except Exception as disk_err:
-            # Fallback to user's home directory
-            try:
-                fallback_root = os.path.expanduser('~')
-                fallback_root = os.path.normpath(fallback_root)
-                if not os.path.isabs(fallback_root):
-                    fallback_root = os.path.abspath(fallback_root)
-                print("[server] fallback_root=", repr(fallback_root), type(fallback_root))
-                disk = psutil.disk_usage(fallback_root)
-            except Exception as disk_err2:
-                # Final fallback to OS root
-                try:
-                    final_root = os.path.abspath(os.sep)
-                    print("[server] final_root=", repr(final_root), type(final_root))
-                    disk = psutil.disk_usage(final_root)
-                except Exception as disk_err3:
-                    raise RuntimeError(
-                        f"disk_usage_failed primary={repr(disk_root)} err={disk_err} "
-                        f"fallback={repr(fallback_root) if 'fallback_root' in locals() else None} err2={disk_err2} "
-                        f"final={repr(final_root) if 'final_root' in locals() else None} err3={disk_err3}"
-                    )
+        # Disk monitoring disabled on this device; show placeholders and skip disk reads
+        disk_total_gb = '-'
+        disk_used_gb = '-'
+        disk_percent_str = '-'
 
         # Check common ports
         common_ports = [22, 80, 443]
@@ -560,10 +514,10 @@ def server():
                 open_ports.append(port)
             sock.close()
 
-        # Store current server stats in database
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('''
+        # Store current server stats in database using a short-lived connection
+        conn_ins = get_db_connection()
+        c_ins = conn_ins.cursor()
+        c_ins.execute('''
             INSERT INTO server_monitoring 
             (hostname, os, cpu_count, cpu_usage, memory_total, memory_used, memory_percent, 
              disk_total, disk_used, disk_percent, open_ports, status)
@@ -576,14 +530,14 @@ def server():
             round(memory.total / (1024**3), 2),
             round(memory.used / (1024**3), 2),
             memory.percent,
-            round(disk.total / (1024**3), 2),
-            round(disk.used / (1024**3), 2),
-            round((disk.used / disk.total) * 100, 2),
+            None,
+            None,
+            None,
             ','.join(map(str, open_ports)),
             'online'
         ))
-        conn.commit()
-        conn.close()
+        conn_ins.commit()
+        conn_ins.close()
 
         server_info = {
             "hostname": hostname,
@@ -593,9 +547,9 @@ def server():
             "memory_total": f"{round(memory.total / (1024**3),2)} GB",
             "memory_used": f"{round(memory.used / (1024**3),2)} GB",
             "memory_percent": f"{memory.percent}%",
-            "disk_total": f"{round(disk.total / (1024**3), 2)} GB",
-            "disk_used": f"{round(disk.used / (1024**3), 2)} GB",
-            "disk_percent": f"{round((disk.used / disk.total) * 100, 2)}%",
+            "disk_total": disk_total_gb,
+            "disk_used": disk_used_gb,
+            "disk_percent": disk_percent_str,
             "open_ports": open_ports
         }
 
