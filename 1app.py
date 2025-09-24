@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+﻿from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback, threading, time
 from email.message import EmailMessage
 
@@ -1284,8 +1284,8 @@ def _watch_servers_and_alert(interval_seconds=60, repeat_minutes=5, send_recover
                 else:
                     # Recovery path if previously offline
                     if _prev_offline.get(sid) and send_recovery and alerts:
-                        subject = f"[RECOVERY] Server ONLINE: {s['name']}"
-                        body = _format_server_summary(s) + f"\nStatus: Online\nTimestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}\nServer is back online."
+                        subject = f"[RECOVERY] Server Offline: {s['name']}"
+                        body = _format_server_summary(s) + f"\nStatus: Online\nTimestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}\nServer offline."
                         for a in alerts:
                             email = a[0]
                             _send_server_email(email, subject, body)
