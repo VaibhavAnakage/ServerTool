@@ -57,7 +57,7 @@
             <div class="card">
                 <h2>Monitored Domains</h2>
                 <div class="table-container">
-                    <table>
+                    <table class="domains-table">
                         <thead>
                             <tr>
                                 <th>Domain</th>
@@ -65,6 +65,7 @@
                                 <th>SSL Expiry</th>
                                 <th>Days to Expiry</th>
                                 <th>Location</th>
+                                <th>Security</th>
                                 <th>Alert Configuration</th>
                                 <th>Actions</th>
                             </tr>
@@ -89,6 +90,14 @@
                                     {% endif %}
                                 </td>
                                 <td>{{ d.location or '-' }}</td>
+                                <td>
+                                    <span class="badge sec-badge" data-domain="{{ d.name|e }}">Loading...</span>
+                                    <div style="margin-top:6px; display:flex; gap:6px;">
+                                        <a class="btn btn-sm btn-secondary" href="/domain/security/{{ d.name }}">View</a>
+                                        <button class="btn btn-sm btn-primary btn-sec-scan" data-domain="{{ d.name|e }}">Scan Now</button>
+                                    </div>
+                                    <div class="sec-time" data-domain="{{ d.name|e }}" style="font-size: 0.85em; margin-top:4px; color:#555;"></div>
+                                </td>
                                 <td>
                                     {% if d.alert_recipients %}
                                         <div style="font-size: 0.9em;">
@@ -118,7 +127,7 @@
                                         {{ 'Edit Alert' if d.alert_recipients else 'Set Alert' }}
                                     </a>
                                     <a href="/domain/edit/{{ d.name }}" class="btn btn-sm btn-secondary" style="margin-left:6px;">Edit</a>
-                                    <form action="/domain/delete/{{ d.name }}" method="POST" style="display:inline-block; margin-left:6px;" onsubmit="return confirm('Delete domain \'"+ ({{ d.name|tojson }}) +"\'?');">
+                                    <form action="/domain/delete/{{ d.name }}" method="POST" style="display:inline-block; margin-left:6px;" onsubmit="return confirm('Delete domain {{ d.name|e }}?');">
                                         <button type="submit" class="btn btn-sm btn-danger">Delete</button>
                                     </form>
                                 </td>
@@ -145,5 +154,56 @@
             </div>
         </div>
     </div>
+
+    
+
+    <script>
+    function statusBadge(summary){
+        if(summary === 'secure') return '<span class="badge badge-success">Secure</span>';
+        if(summary === 'at_risk') return '<span class="badge badge-warning">At Risk</span>';
+        if(summary === 'critical') return '<span class="badge badge-danger">Critical Issues</span>';
+        return '<span class="badge badge-info">Unknown</span>';
+    }
+
+    async function loadSecuritySummaries(){
+        try{
+            const res = await fetch('/api/domain-security/latest', {credentials:'same-origin'});
+            if(!res.ok) return;
+            const data = await res.json();
+            (data.domains||[]).forEach(item => {
+                const badge = document.querySelector('.sec-badge[data-domain="' + item.domain + '"]');
+                const time = document.querySelector('.sec-time[data-domain="' + item.domain + '"]');
+                if(badge){ badge.innerHTML = statusBadge(item.summary_status); }
+                if(time){ time.textContent = item.scanned_at ? ('Last scan: ' + item.scanned_at) : ''; }
+            });
+        }catch(e){}
+    }
+
+    async function scanNow(domain){
+        try{
+            const badge = document.querySelector('.sec-badge[data-domain="' + domain + '"]');
+            const time = document.querySelector('.sec-time[data-domain="' + domain + '"]');
+            if(badge) badge.textContent = 'Scanning...';
+            const res = await fetch('/api/domain-security/scan?domain=' + encodeURIComponent(domain), {method:'POST', credentials:'same-origin'});
+            if(!res.ok) return;
+            const data = await res.json();
+            if(badge){ badge.innerHTML = statusBadge(data.summary_status); }
+            if(time){ time.textContent = 'Last scan: ' + (data.scanned_at || ''); }
+        }catch(e){}
+    }
+
+    // Delegate button clicks to avoid inline handlers
+    document.addEventListener('click', function(ev){
+        const scanBtn = ev.target.closest('.btn-sec-scan');
+        if(scanBtn){
+            const domain = scanBtn.getAttribute('data-domain');
+            if(domain) scanNow(domain);
+            return;
+        }
+    });
+
+    // Initial load
+    loadSecuritySummaries();
+    </script>
 </body>
 </html>

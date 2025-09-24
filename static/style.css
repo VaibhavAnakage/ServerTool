@@ -1,4 +1,12 @@
 /* Modern CSS for Domain Monitoring App */
+:root {
+    --primary: #667eea;
+    --surface: #ffffff;
+    --text: #334155;
+    --muted: #6b7280;
+    --sidebar-width: 240px;
+    --header-height: 64px;
+}
 * {
     margin: 0;
     padding: 0;
@@ -15,62 +23,73 @@ body {
 .container {
     max-width: 1200px;
     margin: 0 auto;
-    padding: 20px;
+    padding: 16px;
+    margin-left: var(--sidebar-width); /* leave room for left sidebar */
 }
 
 /* Header Styles */
 header {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     color: white;
-    padding: 20px 0;
-    margin-bottom: 30px;
+    height: var(--header-height); /* fixed header height */
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    margin-bottom: 0;
     box-shadow: 0 2px 10px rgba(0,0,0,0.1);
 }
 
 header h1 {
-    text-align: center;
-    font-size: 2.5em;
-    font-weight: 300;
+    width: 100%;
+    text-align: right; /* align to right as requested earlier */
+    font-size: 2em;
+    font-weight: 400;
+    margin-right: 8px;
 }
 
 /* Navigation */
 nav {
-    background: white;
-    padding: 15px 0;
-    margin-bottom: 30px;
-    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-    border-radius: 8px;
+    position: fixed;
+    left: 0;
+    top: var(--header-height); /* sit below header */
+    width: calc(var(--sidebar-width) - 20px);
+    height: calc(100vh - var(--header-height));
+    background: var(--surface);
+    padding: 12px 10px;
+    box-shadow: 2px 0 8px rgba(0,0,0,0.06);
+    border-right: 1px solid #eee;
+    overflow-y: auto;
+    z-index: 1000;
 }
+
+/* Reset inner container inside nav so links align to the left edge */
+nav .container {
+    margin: 0;          /* override global .container margin-left */
+    padding: 0;         /* align links to the left edge */
+    max-width: 100%;
+}
+
+/* Nav inner container uses default container spacing */
 
 nav ul {
     list-style: none;
     display: flex;
-    justify-content: center;
-    gap: 30px;
+    flex-direction: column; /* vertical list */
+    gap: 6px;
+    margin: 0;
+    padding: 0;
 }
 
 nav a {
     text-decoration: none;
-    color: #667eea;
+    color: var(--text);
     font-weight: 500;
-    padding: 10px 20px;
-    border-radius: 5px;
-    transition: all 0.3s ease;
-}
-
-nav a:hover {
-    background-color: #667eea;
-    color: white;
-    transform: translateY(-2px);
-}
-
-/* Card Styles */
-.card {
-    background: white;
-    padding: 25px;
-    border-radius: 10px;
-    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-    margin-bottom: 20px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    transition: all 0.2s ease;
+    display: block; /* full width buttons */
+    background: #f5f7ff;
+    border: 1px solid #e5e7eb;
 }
 
 .card h2 {
@@ -167,7 +186,7 @@ nav a:hover {
 /* Table Styles */
 .table-container {
     overflow-x: auto;
-    margin-top: 20px;
+    margin-top: 12px;
 }
 
 table {
@@ -183,6 +202,62 @@ th, td {
     padding: 12px 15px;
     text-align: left;
     border-bottom: 1px solid #e1e5e9;
+}
+
+/* Sticky table headers */
+.table-container thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+/* Domain Monitoring table column widths */
+.domains-table th:nth-child(1),
+.domains-table td:nth-child(1) { /* Domain */
+    min-width: 160px;
+    width: 18%;
+}
+.domains-table th:nth-child(2),
+.domains-table td:nth-child(2) { /* SSL Issuer */
+    min-width: 180px;
+    width: 20%;
+}
+.domains-table th:nth-child(3),
+.domains-table td:nth-child(3) { /* SSL Expiry */
+    min-width: 120px;
+    width: 12%;
+}
+.domains-table th:nth-child(4),
+.domains-table td:nth-child(4) { /* Days */
+    min-width: 110px;
+    width: 10%;
+}
+.domains-table th:nth-child(5),
+.domains-table td:nth-child(5) { /* Location */
+    min-width: 120px;
+    width: 12%;
+}
+.domains-table th:nth-child(6),
+.domains-table td:nth-child(6) { /* Security */
+    min-width: 160px;
+    width: 16%;
+}
+.domains-table th:nth-child(7),
+.domains-table td:nth-child(7) { /* Alert Config */
+    min-width: 220px;
+    width: 22%;
+}
+.domains-table th:nth-child(8),
+.domains-table td:nth-child(8) { /* Actions */
+    min-width: 160px;
+    width: 12%;
+}
+
+/* Truncate utility */
+.truncate {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 th {
@@ -226,12 +301,6 @@ tr:last-child td {
     background-color: #d1ecf1;
     border-color: #17a2b8;
     color: #0c5460;
-}
-
-.alert-danger {
-    background-color: #f8d7da;
-    border-color: #dc3545;
-    color: #721c24;
 }
 
 /* Status Indicators */
@@ -283,28 +352,25 @@ tr:last-child td {
     background-color: #17a2b8;
     color: white;
 }
-
 /* Responsive Design */
 @media (max-width: 768px) {
     .container {
         padding: 10px;
+        margin-left: 0; /* remove sidebar offset on small screens */
     }
+    nav {
+        position: static;
+        width: auto;
+        height: auto;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.08);
+        border-right: none;
+        margin-bottom: 10px;
+    }
+    nav ul { flex-direction: row; flex-wrap: wrap; justify-content: center; }
     
     header h1 {
-        font-size: 2em;
-    }
-    
-    nav ul {
-        flex-direction: column;
-        gap: 10px;
-    }
-    
-    table {
-        font-size: 14px;
-    }
-    
-    th, td {
-        padding: 8px 10px;
+        font-size: 1.6em;
+        text-align: center;
     }
 }
 

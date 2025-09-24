@@ -1,4 +1,4 @@
-﻿from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback, threading, time
 from email.message import EmailMessage
 
@@ -1143,6 +1143,358 @@ def api_server_status_latest():
     conn.close()
     return jsonify({"server_status": rows})
 
+# ---------- Domain Security Monitoring ----------
+def ensure_domain_security_schema():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS domain_security (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain_name TEXT NOT NULL,
+            scanned_at TEXT NOT NULL,
+            summary_status TEXT,
+            details_json TEXT
+        )
+        """
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_domain_security_domain_time ON domain_security(domain_name, scanned_at)")
+    conn.commit()
+    conn.close()
+
+ensure_domain_security_schema()
+
+def _run_nslookup(args):
+    try:
+        result = subprocess.run(["nslookup", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, text=True)
+        if result.returncode == 0:
+            return result.stdout
+    except Exception:
+        pass
+    return ""
+
+def _check_spf(domain):
+    out = _run_nslookup(["-type=TXT", domain])
+    spf = None
+    permissive = False
+    for line in out.splitlines():
+        if "v=spf1" in line:
+            spf = line.strip()
+            if "+all" in spf:
+                permissive = True
+    return {"present": bool(spf), "record": spf, "permissive": permissive}
+
+def _check_dmarc(domain):
+    out = _run_nslookup(["-type=TXT", f"_dmarc.{domain}"])
+    rec = None
+    policy = None
+    for line in out.splitlines():
+        if "v=DMARC1" in line.upper():
+            rec = line.strip()
+            # parse p=
+            up = rec.replace(" ", "")
+            idx = up.lower().find("p=")
+            if idx != -1:
+                policy = up[idx+2:].split(";")[0]
+    return {"present": bool(rec), "record": rec, "policy": policy}
+
+def _check_dkim(domain):
+    selectors = ["default", "selector1", "s1", "dkim", "mail"]
+    found = []
+    for sel in selectors:
+        out = _run_nslookup(["-type=TXT", f"{sel}._domainkey.{domain}"])
+        if out:
+            found.append({"selector": sel, "record": out.strip()})
+    return {"present": bool(found), "records": found}
+
+def _check_dnssec(domain):
+    out = _run_nslookup(["-type=DNSKEY", domain])
+    enabled = "DNSKEY" in out or "flags" in out.lower()
+    return {"enabled": enabled}
+
+def _check_mx(domain):
+    out = _run_nslookup(["-type=MX", domain])
+    mx = []
+    for line in out.splitlines():
+        if "mail exchanger" in line:
+            parts = line.split("=")
+            host = parts[-1].strip().rstrip('.') if parts else line.strip()
+            mx.append(host)
+    return {"records": mx}
+
+def _tls_check(domain):
+    info = {"expiry": None, "trusted": None, "protocol": None}
+    try:
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.socket(socket.AF_INET), server_hostname=domain) as s:
+            s.settimeout(5)
+            s.connect((domain, 443))
+            cert = s.getpeercert()
+            info["protocol"] = s.version()
+            not_after = cert.get('notAfter')
+            if not_after:
+                exp = datetime.datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+                info["expiry"] = exp.strftime("%Y-%m-%d")
+            info["trusted"] = True
+    except ssl.SSLError:
+        info["trusted"] = False
+    except Exception:
+        pass
+    # Protocol assessment
+    weak_protocol = info.get("protocol") in ("SSLv2", "SSLv3", "TLSv1", "TLSv1.1")
+    info["weak_protocol"] = weak_protocol
+    return info
+
+def _http_headers(domain):
+    headers = {}
+    try:
+        import urllib.request
+        req = urllib.request.Request(url=f"https://{domain}/", method="GET")
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            hdrs = resp.headers
+            for k in [
+                "Strict-Transport-Security",
+                "X-Frame-Options",
+                "X-Content-Type-Options",
+                "Content-Security-Policy",
+                "Referrer-Policy",
+                "Permissions-Policy",
+            ]:
+                headers[k] = hdrs.get(k)
+    except Exception:
+        pass
+    return headers
+
+def _blacklist_status(domain):
+    # Placeholder unless APIs configured. Returns unknown by default.
+    return {"status": "unknown"}
+
+def _subdomains(domain):
+    subs = []
+    try:
+        import json
+        import urllib.request
+        url = f"https://crt.sh/?q=%25.{domain}&output=json"
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+            for item in data:
+                name = item.get("name_value")
+                if name and domain in name:
+                    for sub in name.split('\n'):
+                        if sub not in subs:
+                            subs.append(sub)
+    except Exception:
+        pass
+    return {"count": len(subs), "items": subs[:50]}
+
+def _ports(domain):
+    open_ports = []
+    ports = [21, 22, 25, 80, 443, 3306]
+    for p in ports:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            if sock.connect_ex((domain, p)) == 0:
+                open_ports.append(p)
+            sock.close()
+        except Exception:
+            pass
+    return {"open": open_ports}
+
+def scan_domain_security(domain):
+    result = {
+        "domain": domain,
+        "scanned_at": datetime.datetime.now().isoformat(sep=' ', timespec='seconds'),
+        "dns_email": {
+            "spf": _check_spf(domain),
+            "dkim": _check_dkim(domain),
+            "dmarc": _check_dmarc(domain),
+            "dnssec": _check_dnssec(domain),
+            "mx": _check_mx(domain),
+        },
+        "tls": _tls_check(domain),
+        "http_headers": _http_headers(domain),
+        "reputation": _blacklist_status(domain),
+        "subdomains": _subdomains(domain),
+        "ports": _ports(domain),
+    }
+    # Summary badge
+    critical = False
+    warning = False
+    # SPF
+    spf = result["dns_email"]["spf"]
+    if not spf["present"] or spf.get("permissive"):
+        warning = True
+    # DMARC
+    dmarc = result["dns_email"]["dmarc"]
+    if not dmarc["present"] or (dmarc.get("policy") in (None, "none")):
+        warning = True
+    # TLS
+    tls = result["tls"]
+    if tls.get("weak_protocol") or tls.get("trusted") is False:
+        critical = True
+    # Ports
+    ports = result["ports"].get("open", [])
+    risky_ports = {21, 22, 25, 3306}
+    if any(p in risky_ports for p in ports):
+        warning = True
+    # Reputation
+    if result["reputation"].get("status") == "blacklisted":
+        critical = True
+
+    if critical:
+        summary = "critical"
+    elif warning:
+        summary = "at_risk"
+    else:
+        summary = "secure"
+    result["summary_status"] = summary
+    return result
+
+@app.route('/api/domain-security/scan', methods=['POST', 'GET'])
+@login_required
+def api_domain_security_scan():
+    user = get_current_user()
+    domain = request.args.get('domain') or (request.json.get('domain') if request.is_json else request.form.get('domain'))
+    if not domain:
+        return jsonify({"error": "domain required"}), 400
+    # RBAC: allowed by location
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT name, location FROM domains WHERE name=?", (domain,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "domain not found"}), 404
+    if user and user["role"] in ("admin", "analytics") and not user_can_access_location(user, row["location"]):
+        conn.close()
+        return jsonify({"error": "access denied"}), 403
+    # Scan
+    result = scan_domain_security(domain)
+    import json as _json
+    c.execute("INSERT INTO domain_security(domain_name, scanned_at, summary_status, details_json) VALUES(?, ?, ?, ?)",
+              (domain, result["scanned_at"], result["summary_status"], _json.dumps(result)))
+    conn.commit()
+    conn.close()
+    return jsonify(result)
+
+@app.route('/api/domain-security/latest')
+@login_required
+def api_domain_security_latest():
+    user = get_current_user()
+    conn = get_db_connection()
+    c = conn.cursor()
+    base_sql = """
+        SELECT d.name as domain, d.location,
+               ds.summary_status, ds.scanned_at, ds.details_json
+        FROM domains d
+        LEFT JOIN (
+            SELECT x.domain_name, x.summary_status, x.scanned_at, x.details_json
+            FROM domain_security x
+            JOIN (
+                SELECT domain_name, MAX(scanned_at) as max_ts
+                FROM domain_security
+                GROUP BY domain_name
+            ) y ON x.domain_name = y.domain_name AND x.scanned_at = y.max_ts
+        ) ds ON ds.domain_name = d.name
+    """
+    params = []
+    if user and user["role"] in ("admin", "analytics"):
+        base_sql += " WHERE LOWER(d.location)=LOWER(?)"
+        params.append(user["location"] or "")
+    base_sql += " ORDER BY d.name"
+    c.execute(base_sql, params)
+    rows = c.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "domain": r["domain"],
+            "location": r["location"],
+            "summary_status": r["summary_status"],
+            "scanned_at": r["scanned_at"],
+        })
+    conn.close()
+    return jsonify({"domains": out})
+
+@app.route('/domain/security/<path:domain>')
+@login_required
+def domain_security_details(domain):
+    """Render a full-page security details view for a domain using the latest scan.
+    If no scan exists, trigger a scan first.
+    """
+    user = get_current_user()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT name, location FROM domains WHERE name=?", (domain,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        flash("Domain not found.", "danger")
+        return redirect(url_for('domain'))
+    if user and user["role"] in ("admin", "analytics") and not user_can_access_location(user, row["location"]):
+        conn.close()
+        flash("Access denied for this location.", "danger")
+        return redirect(url_for('domain'))
+
+    # Get latest security scan; if absent, run one
+    c.execute(
+        """
+        SELECT details_json, scanned_at, summary_status
+        FROM domain_security
+        WHERE domain_name=?
+        ORDER BY scanned_at DESC
+        LIMIT 1
+        """,
+        (domain,)
+    )
+    latest = c.fetchone()
+    import json as _json
+    if not latest:
+        result = scan_domain_security(domain)
+        c.execute(
+            "INSERT INTO domain_security(domain_name, scanned_at, summary_status, details_json) VALUES(?, ?, ?, ?)",
+            (domain, result["scanned_at"], result["summary_status"], _json.dumps(result))
+        )
+        conn.commit()
+        details = result
+    else:
+        details = _json.loads(latest["details_json"]) if latest and latest["details_json"] else None
+    conn.close()
+
+    if not details:
+        flash("Failed to load domain security details.", "danger")
+        return redirect(url_for('domain'))
+
+    return render_template('domain_security.html', details=details, user=user)
+
+# periodic scanner
+_domain_scanner_started = False
+
+def _domain_security_scanner_loop(interval_hours=6):
+    while True:
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("SELECT name FROM domains")
+            domains = [r[0] for r in c.fetchall()]
+            conn.close()
+            for d in domains:
+                try:
+                    # Best-effort scan, ignore failures
+                    res = scan_domain_security(d)
+                    conn2 = get_db_connection()
+                    c2 = conn2.cursor()
+                    import json as _json
+                    c2.execute("INSERT INTO domain_security(domain_name, scanned_at, summary_status, details_json) VALUES(?, ?, ?, ?)",
+                              (d, res["scanned_at"], res["summary_status"], _json.dumps(res)))
+                    conn2.commit()
+                    conn2.close()
+                except Exception as _e:
+                    pass
+        except Exception as e:
+            print("[domain_scanner] error:", e)
+        time.sleep(max(60, int(interval_hours*3600)))
+
 # ---------- Server Alerts APIs & Watcher ----------
 
 def is_valid_email(email: str) -> bool:
@@ -1298,7 +1650,7 @@ def _watch_servers_and_alert(interval_seconds=60, repeat_minutes=5, send_recover
         time.sleep(interval_seconds)
 
 def _start_watcher_once():
-    global _watcher_thread_started, _pinger_thread_started
+    global _watcher_thread_started, _pinger_thread_started, _domain_scanner_started
     # Avoid double start under Flask reloader
     if os.environ.get('WERKZEUG_RUN_MAIN') not in ('true', 'True') and app.debug:
         return
@@ -1310,6 +1662,10 @@ def _start_watcher_once():
         p = threading.Thread(target=_background_ping_loop, kwargs={"interval_seconds": 3}, daemon=True)
         p.start()
         _pinger_thread_started = True
+    if not _domain_scanner_started:
+        ds = threading.Thread(target=_domain_security_scanner_loop, kwargs={"interval_hours": 6}, daemon=True)
+        ds.start()
+        _domain_scanner_started = True
 
 def _background_ping_loop(interval_seconds=10):
     while True:

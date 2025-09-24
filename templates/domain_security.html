@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Domain Security - {{ details.domain }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+      .section-title { display:flex; align-items:center; gap:8px; margin:0 0 8px 0; }
+      .kv { display:grid; grid-template-columns: 220px 1fr; gap:6px 12px; align-items:start; }
+      .muted { color:#666; font-size:0.95em; }
+      .list { margin: 6px 0 0 0; padding-left: 18px; }
+      .list-scroll { max-height: 260px; overflow: auto; border: 1px solid #eee; border-radius: 6px; padding: 8px 12px; }
+      .pill { display:inline-block; padding:2px 8px; border-radius:12px; font-size: 0.85em; border:1px solid #ddd; margin:2px 4px 0 0; }
+      .danger { color:#b91c1c; }
+      .warn { color:#b45309; }
+      .ok { color:#15803d; }
+      .header-row { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Domain Security Details</h1>
+        </div>
+    </header>
+
+    <nav>
+        <div class="container">
+            <ul>
+                <li><a href="/">Dashboard</a></li>
+                <li><a href="/domain" class="active">Domain Monitoring</a></li>
+                <li><a href="/server">Server Info</a></li>
+                <li><a href="/server/history">Server History</a></li>
+                {% if user %}
+                    <li style="margin-left:auto"><a href="/logout">Logout ({{ user.name }})</a></li>
+                {% else %}
+                    <li style="margin-left:auto"><a href="/login">Login</a></li>
+                {% endif %}
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert alert-{{ category }}">
+                <strong>{{ category.title() }}:</strong> {{ message }}
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+
+        <div class="card">
+            <div class="header-row">
+                <div>
+                    <h2 style="margin:0 0 6px 0;">{{ details.domain }}</h2>
+                    <div class="muted">Last scan: {{ details.scanned_at }}</div>
+                </div>
+                <div>
+                    {% set s = details.summary_status %}
+                    {% if s == 'secure' %}
+                        <span class="badge badge-success">✅ Secure</span>
+                    {% elif s == 'at_risk' %}
+                        <span class="badge badge-warning">⚠ At Risk</span>
+                    {% elif s == 'critical' %}
+                        <span class="badge badge-danger">❌ Critical Issues</span>
+                    {% else %}
+                        <span class="badge badge-info">Unknown</span>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <!-- TLS / SSL Security -->
+            <div class="card">
+                <h3 class="section-title">🔐 TLS / SSL Security</h3>
+                {% set tls = details.tls or {} %}
+                <div class="kv">
+                    <div>Expiry date</div><div>{{ tls.expiry or '-' }}</div>
+                    <div>Protocol</div><div>{{ tls.protocol or '-' }}</div>
+                    <div>Trusted</div><div>{% if tls.trusted is sameas(true) %}<span class="ok">Yes</span>{% elif tls.trusted is sameas(false) %}<span class="danger">No</span>{% else %}-{% endif %}</div>
+                    <div>Weak protocols supported</div><div>{% if tls.weak_protocol %}<span class="danger">Yes</span>{% else %}<span class="ok">No</span>{% endif %}</div>
+                </div>
+                {% if tls.weak_protocol %}
+                    <div class="alert alert-warning" style="margin-top:10px;">
+                        <strong>Warning:</strong> Weak TLS protocols (TLS 1.0/1.1) allow downgrade and MITM attacks.
+                    </div>
+                {% endif %}
+            </div>
+
+            <!-- DNS & Email Security -->
+            <div class="card">
+                <h3 class="section-title">🧭 DNS & Email Security</h3>
+                {% set de = details.dns_email or {} %}
+                {% set spf = de.spf or {} %}
+                {% set dkim = de.dkim or {} %}
+                {% set dmarc = de.dmarc or {} %}
+                {% set dnssec = de.dnssec or {} %}
+                {% set mx = de.mx or {} %}
+                <div class="kv">
+                    <div>SPF</div><div>{% if spf.present %}<span class="ok">Present</span>{% else %}<span class="danger">Missing</span>{% endif %}</div>
+                    <div>SPF Permissive</div><div>{% if spf.permissive %}<span class="warn">Yes (+all)</span>{% else %}<span class="ok">No</span>{% endif %}</div>
+                    <div>DKIM</div><div>{% if dkim.present %}<span class="ok">Present</span>{% else %}<span class="danger">Missing</span>{% endif %}</div>
+                    <div>DMARC</div><div>{% if dmarc.present %}<span class="ok">Present</span> (policy={{ dmarc.policy or 'unknown' }}){% else %}<span class="danger">Missing</span>{% endif %}</div>
+                    <div>DNSSEC</div><div>{% if dnssec.enabled %}<span class="ok">Enabled</span>{% else %}<span class="danger">Disabled</span>{% endif %}</div>
+                    <div>MX Records</div><div>{% if (mx.records or [])|length %}{% for m in mx.records %}<span class="pill">{{ m }}</span>{% endfor %}{% else %}-{% endif %}</div>
+                </div>
+                {% if not spf.present %}
+                <div class="alert alert-danger" style="margin-top:10px;">
+                    ❌ Without SPF, attackers can spoof your domain in emails.
+                </div>
+                {% endif %}
+                {% if not dkim.present %}
+                <div class="alert alert-danger" style="margin-top:10px;">
+                    ❌ Without DKIM, email integrity cannot be verified.
+                </div>
+                {% endif %}
+                {% if not dmarc.present %}
+                <div class="alert alert-warning" style="margin-top:10px;">
+                    ⚠ Without DMARC, spoofed emails will not be blocked.
+                </div>
+                {% endif %}
+                {% if not dnssec.enabled %}
+                <div class="alert alert-danger" style="margin-top:10px;">
+                    ❌ DNSSEC not enabled. Domain is vulnerable to DNS spoofing.
+                </div>
+                {% endif %}
+            </div>
+
+            <!-- HTTP Security Headers -->
+            <div class="card">
+                <h3 class="section-title">🛡 HTTP Security Headers</h3>
+                {% set hh = details.http_headers or {} %}
+                <div class="kv">
+                    <div>HSTS</div><div>{{ hh['Strict-Transport-Security'] or 'Missing' }}</div>
+                    <div>X-Frame-Options</div><div>{{ hh['X-Frame-Options'] or 'Missing' }}</div>
+                    <div>X-Content-Type-Options</div><div>{{ hh['X-Content-Type-Options'] or 'Missing' }}</div>
+                    <div>Content-Security-Policy</div><div>{{ hh['Content-Security-Policy'] or 'Missing' }}</div>
+                    <div>Referrer-Policy</div><div>{{ hh['Referrer-Policy'] or 'Missing' }}</div>
+                    <div>Permissions-Policy</div><div>{{ hh['Permissions-Policy'] or 'Missing' }}</div>
+                </div>
+                {% if not hh['Content-Security-Policy'] %}
+                    <div class="alert alert-warning" style="margin-top:10px;">⚠ Missing CSP increases risk of XSS attacks.</div>
+                {% endif %}
+                {% if not hh['Strict-Transport-Security'] %}
+                    <div class="alert alert-warning" style="margin-top:10px;">⚠ Missing HSTS allows protocol downgrade and cookie hijacking.</div>
+                {% endif %}
+            </div>
+
+            <!-- Reputation & Blacklist -->
+            <div class="card">
+                <h3 class="section-title">🧪 Reputation & Blacklist</h3>
+                {% set rep = details.reputation or {} %}
+                <div>Status: {{ rep.status or 'unknown' }}</div>
+                {% if rep.status == 'blacklisted' %}
+                <div class="alert alert-danger" style="margin-top:10px;">
+                    ❌ Domain is on a known blacklist. Emails or site may be blocked by browsers and mail servers.
+                </div>
+                {% endif %}
+            </div>
+
+            <!-- Subdomains -->
+            <div class="card">
+                <h3 class="section-title">🧩 Subdomains</h3>
+                {% set subs = details.subdomains or {} %}
+                <div>Count: {{ subs.count or 0 }}</div>
+                {% if (subs['items'] or [])|length %}
+                    <ul class="list list-scroll">
+                        {% for s in subs['items'] %}
+                            <li>{{ s }}</li>
+                        {% endfor %}
+                    </ul>
+                {% else %}
+                    <div class="muted">No subdomains detected.</div>
+                {% endif %}
+                <div class="alert alert-warning" style="margin-top:10px;">
+                    ⚠ If any subdomain has a dangling CNAME to an inactive service, it may be vulnerable to takeover.
+                </div>
+            </div>
+
+            <!-- Open Ports -->
+            <div class="card">
+                <h3 class="section-title">🔌 Open Ports</h3>
+                {% set ports = (details.ports or {}).open or [] %}
+                {% if ports|length %}
+                    <div>
+                        {% for p in ports %}<span class="pill">{{ p }}</span>{% endfor %}
+                    </div>
+                {% else %}
+                    <div class="muted">No common ports detected as open.</div>
+                {% endif %}
+                {% set risky = [21,22,25,3306] %}
+                {% if ports|select('in', risky)|list|length %}
+                    <div class="alert alert-danger" style="margin-top:10px;">
+                        ❌ Sensitive ports exposed (e.g., database or admin services). High risk of compromise.
+                    </div>
+                {% else %}
+                    {% if ports|length and (ports == [80] or ports == [443] or ports == [80,443] or ports == [443,80]) %}
+                        <div class="alert alert-success" style="margin-top:10px;">
+                            ✅ Only web ports (80/443) exposed.
+                        </div>
+                    {% endif %}
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</body>
+</html>
