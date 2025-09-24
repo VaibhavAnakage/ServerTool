@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
-import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback
+import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback, threading, time
 from email.message import EmailMessage
 
 app = Flask(__name__)
@@ -73,6 +73,27 @@ def ensure_server_status_schema():
     conn.close()
 
 ensure_server_status_schema()
+
+# ---------- Server Alerts Schema ----------
+def ensure_server_alerts_schema():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS server_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            email_address TEXT NOT NULL,
+            last_alert_sent TEXT,
+            UNIQUE(server_id, email_address),
+            FOREIGN KEY(server_id) REFERENCES servers(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+ensure_server_alerts_schema()
 
 # ---------- Auth & RBAC Helpers ----------
 def get_current_user():
@@ -1128,6 +1149,165 @@ def api_server_status_latest():
     conn.close()
     return jsonify({"server_status": rows})
 
+# ---------- Server Alerts APIs & Watcher ----------
+
+def is_valid_email(email: str) -> bool:
+    if not email:
+        return False
+    return "@" in email and "." in email
+
+@app.route('/api/server-alerts/<int:server_id>', methods=['GET'])
+@login_required
+def api_list_server_alerts(server_id):
+    user = get_current_user()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, name, location FROM servers WHERE id=?", (server_id,))
+    s = c.fetchone()
+    if not s:
+        conn.close()
+        return jsonify({"error": "server not found"}), 404
+    if not user_can_access_location(user, s["location"]):
+        conn.close()
+        return jsonify({"error": "access denied"}), 403
+    c.execute("SELECT email_address, last_alert_sent FROM server_alerts WHERE server_id=? ORDER BY email_address", (server_id,))
+    rows = [{"email": r[0], "last_alert_sent": r[1]} for r in c.fetchall()]
+    conn.close()
+    return jsonify({"server_id": server_id, "emails": rows})
+
+@app.route('/api/server-alerts/<int:server_id>', methods=['POST'])
+@login_required
+@rbac_write_required
+def api_add_server_alert_email(server_id):
+    user = get_current_user()
+    email = (request.form.get('email') or request.json.get('email') if request.is_json else request.form.get('email')) if request else None
+    email = (email or '').strip().lower()
+    if not is_valid_email(email):
+        return jsonify({"error": "invalid email"}), 400
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT location FROM servers WHERE id=?", (server_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "server not found"}), 404
+    if not user_can_access_location(user, row["location"]):
+        conn.close()
+        return jsonify({"error": "access denied"}), 403
+    try:
+        c.execute("INSERT OR IGNORE INTO server_alerts(server_id, email_address) VALUES(?, ?)", (server_id, email))
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/server-alerts/<int:server_id>/delete', methods=['POST'])
+@login_required
+@rbac_write_required
+def api_delete_server_alert_email(server_id):
+    user = get_current_user()
+    email = (request.form.get('email') or request.json.get('email') if request.is_json else request.form.get('email')) if request else None
+    email = (email or '').strip().lower()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT location FROM servers WHERE id=?", (server_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "server not found"}), 404
+    if not user_can_access_location(user, row["location"]):
+        conn.close()
+        return jsonify({"error": "access denied"}), 403
+    try:
+        c.execute("DELETE FROM server_alerts WHERE server_id=? AND email_address=?", (server_id, email))
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+# Background watcher for offline/online alerts
+_watcher_thread_started = False
+_prev_offline = {}
+
+def _send_server_email(recipients, subject, body):
+    return send_email_smtp(recipients, subject, body)
+
+def _format_server_summary(s):
+    return f"Server: {s['name']} (IP: {s['ip_address']}, Location: {s['location']})"
+
+def _watch_servers_and_alert(interval_seconds=60, repeat_minutes=5, send_recovery=True):
+    global _prev_offline
+    while True:
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            # Get servers and their alert emails
+            c.execute("SELECT id, name, ip_address, location, alive FROM servers")
+            servers = [dict(r) for r in c.fetchall()]
+
+            now = datetime.datetime.now()
+            for s in servers:
+                sid = s['id']
+                offline = not bool(s.get('alive', 0))
+                # Load alert emails
+                c.execute("SELECT email_address, last_alert_sent FROM server_alerts WHERE server_id=?", (sid,))
+                alerts = c.fetchall()
+                if offline:
+                    # Immediate and repeated alerts
+                    for a in alerts:
+                        email = a[0]
+                        last_sent = a[1]
+                        should_send = False
+                        if not last_sent:
+                            should_send = True
+                        else:
+                            try:
+                                last_dt = datetime.datetime.fromisoformat(last_sent)
+                            except Exception:
+                                last_dt = None
+                            if not last_dt or (now - last_dt).total_seconds() >= repeat_minutes * 60:
+                                should_send = True
+                        if should_send:
+                            subject = f"[ALERT] Server OFFLINE: {s['name']}"
+                            body = _format_server_summary(s) + f"\nStatus: Offline\nTimestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}\nServer has gone offline."
+                            ok, err = _send_server_email(email, subject, body)
+                            if ok:
+                                c.execute("UPDATE server_alerts SET last_alert_sent=? WHERE server_id=? AND email_address=?", (now.isoformat(sep=' ', timespec='seconds'), sid, email))
+                                conn.commit()
+                    _prev_offline[sid] = True
+                else:
+                    # Recovery path if previously offline
+                    if _prev_offline.get(sid) and send_recovery and alerts:
+                        subject = f"[RECOVERY] Server ONLINE: {s['name']}"
+                        body = _format_server_summary(s) + f"\nStatus: Online\nTimestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}\nServer is back online."
+                        for a in alerts:
+                            email = a[0]
+                            _send_server_email(email, subject, body)
+                        # Reset last_alert_sent to allow fresh cycles on next offline
+                        c.execute("UPDATE server_alerts SET last_alert_sent=NULL WHERE server_id=?", (sid,))
+                        conn.commit()
+                    _prev_offline[sid] = False
+
+            conn.close()
+        except Exception as e:
+            # Avoid crashing the watcher
+            print("[watcher] error:", e)
+        time.sleep(interval_seconds)
+
+def _start_watcher_once():
+    global _watcher_thread_started
+    if not _watcher_thread_started:
+        t = threading.Thread(target=_watch_servers_and_alert, kwargs={"interval_seconds": 60, "repeat_minutes": 5, "send_recovery": True}, daemon=True)
+        t.start()
+        _watcher_thread_started = True
+
 if __name__ == '__main__':
+    _start_watcher_once()
     app.run(debug=True, host='0.0.0.0', port=5000)
 
