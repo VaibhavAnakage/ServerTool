@@ -111,55 +111,59 @@
                         </div>
                     </div>
                 </div>
-
-                <div class="card">
-                    <h2>Quick Actions</h2>
-                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                        <a href="/server/history" class="btn btn-primary">View History</a>
-                        <button onclick="location.reload()" class="btn btn-secondary">Refresh Data</button>
-                        <a href="/run_alerts" class="btn btn-success">Run Alerts</a>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h2>Servers</h2>
-                    <div class="table-container" id="servers-table-container">
-                        <table id="servers-table">
-                            <thead>
-                                <tr>
-                                    <th>Name</th>
-                                    <th>IP</th>
-                                    <th>Location</th>
-                                    <th>Alive</th>
-                                    <th>Last Ping</th>
-                                    <th>Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for s in servers %}
-                                <tr data-id="{{ s.id }}">
-                                    <td class="name">{{ s.name }}</td>
-                                    <td class="ip">{{ s.ip_address }}</td>
-                                    <td class="location">{{ s.location or '-' }}</td>
-                                    <td class="alive">
-                                        {% if s.alive %}
-                                            <span class="badge badge-success">Online</span>
-                                        {% else %}
-                                            <span class="badge badge-danger">Offline</span>
-                                        {% endif %}
-                                    </td>
-                                    <td class="last_ping">{{ s.last_ping_at or '-' }}</td>
-                                    <td>
-                                        <a href="/server/ping/{{ s.id }}" class="btn btn-sm btn-secondary">Ping</a>
-                                    </td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
             {% endif %}
         {% endif %}
+
+        <div class="card">
+            <h2>Quick Actions</h2>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <a href="/server/history" class="btn btn-primary">View History</a>
+                <button onclick="location.reload()" class="btn btn-secondary">Refresh Data</button>
+                <a href="/run_alerts" class="btn btn-success">Run Alerts</a>
+            </div>
+        </div>
+
+        
+
+        <div class="card">
+            <h2>Servers</h2>
+            <div class="table-container" id="servers-table-container">
+                <table id="servers-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>IP</th>
+                            <th>Location</th>
+                            <th>Alive</th>
+                            <th>Last Ping</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for s in servers %}
+                        <tr data-id="{{ s.id }}">
+                            <td class="name">{{ s.name }}</td>
+                            <td class="ip">{{ s.ip_address }}</td>
+                            <td class="location">{{ s.location or '-' }}</td>
+                            <td class="alive">
+                                {% if s.alive %}
+                                    <span class="badge badge-success">Online</span>
+                                {% else %}
+                                    <span class="badge badge-danger">Offline</span>
+                                {% endif %}
+                            </td>
+                            <td class="last_ping">{{ s.last_ping_at or '-' }}</td>
+                            <td>
+                                <a href="/server/ping/{{ s.id }}" class="btn btn-sm btn-secondary">Ping</a>
+                                <a href="/server/edit/{{ s.id }}" class="btn btn-sm btn-primary" style="margin-left:6px;">Edit</a>
+                                <form action="/server/delete/{{ s.id }}" method="POST" style="display:inline-block; margin-left:6px;" onsubmit="return confirm('Delete server \' + ({{ s.name|tojson }}) + '\'?');">
+                                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                </table>
+            </div>
     </div>
     <script>
     // Auto-refresh server statuses every 15 seconds
@@ -191,6 +195,8 @@
         }
     }
     setInterval(refreshServers, 15000);
+    // Initial load
+    refreshServers();
     </script>
 </body>
 </html>

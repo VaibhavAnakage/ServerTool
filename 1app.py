@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+﻿from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback
 from email.message import EmailMessage
 
@@ -268,6 +268,7 @@ def domain():
         else:
             flash(f"Domain {domain_name} already exists.", "info")
 
+        conn.close()
         return redirect(url_for('domain'))
 
     # Fetch all domains and their alert settings
@@ -318,6 +319,54 @@ def domain():
 
     conn.close()
     return render_template('domain.html', domains=domains, now=now.date(), locations=get_locations(), user=user)
+
+@app.route('/domain/edit/<path:domain_name>', methods=['GET', 'POST'])
+@login_required
+@rbac_write_required
+def edit_domain(domain_name):
+    """Edit domain properties. Currently only allows updating location (name immutable)."""
+    user = get_current_user()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT name, registrar, creation_date, expiration_date, ssl_issuer, ssl_expiry, location FROM domains WHERE name=?", (domain_name,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        flash("Domain not found.", "danger")
+        return redirect(url_for('domain'))
+    if not user_can_access_location(user, row["location"]):
+        conn.close()
+        flash("Access denied for this location.", "danger")
+        return redirect(url_for('domain'))
+
+    if request.method == 'POST':
+        location = request.form.get('location', '').strip()
+        if not user_can_access_location(user, location):
+            flash("You cannot set this domain's location.", "danger")
+            conn.close()
+            return redirect(url_for('edit_domain', domain_name=domain_name))
+        try:
+            c.execute("UPDATE domains SET location=? WHERE name=?", (location, domain_name))
+            conn.commit()
+            flash("Domain updated.", "success")
+        except Exception as e:
+            conn.rollback()
+            flash(f"Failed to update domain: {e}", "danger")
+        finally:
+            conn.close()
+        return redirect(url_for('domain'))
+
+    domain_row = {
+        "name": row["name"],
+        "registrar": row["registrar"],
+        "creation_date": row["creation_date"],
+        "expiration_date": row["expiration_date"],
+        "ssl_issuer": row["ssl_issuer"],
+        "ssl_expiry": row["ssl_expiry"],
+        "location": row["location"],
+    }
+    conn.close()
+    return render_template('domain_edit.html', domain=domain_row, locations=get_locations(), user=user)
 
 @app.route('/alert', methods=['GET', 'POST'])
 @login_required
@@ -465,12 +514,12 @@ def run_alerts():
 @login_required
 def server():
     user = get_current_user()
-    conn = get_db_connection()
-    c = conn.cursor()
     if request.method == 'POST':
         if is_read_only(user):
             flash("You have read-only access.", "warning")
             return redirect(url_for('server'))
+        conn = get_db_connection()
+        c = conn.cursor()
         name = request.form.get('name', '').strip()
         ip_address = request.form.get('ip_address', '').strip()
         location = request.form.get('location', '').strip()
@@ -493,117 +542,91 @@ def server():
         finally:
             conn.close()
         return redirect(url_for('server'))
-    try:
-        hostname = platform.node()
-        os_info = f"{platform.system()} {platform.release()}"
-        cpu_count = psutil.cpu_count(logical=True)
-        cpu_percent = psutil.cpu_percent(interval=1)
-        memory = psutil.virtual_memory()
-        # Resolve a clean disk root path with multiple layers of safety
+
+    # Skip local stats collection by default
+    collect_local = os.environ.get('COLLECT_LOCAL_STATS', '0') == '1'
+    if collect_local:
         try:
-            # 1) Allow override via env
-            disk_root = os.environ.get("DISK_ROOT")
-            # 2) Else prefer Windows system drive, else fallback to '/'
-            if not disk_root:
-                sys_drive = os.getenv('SystemDrive')  # e.g. 'C:'
-                if sys_drive:
-                    disk_root = sys_drive
-                else:
-                    disk_root = os.path.abspath(os.sep)
-
-            # Ensure string type
-            if isinstance(disk_root, bytes):
-                disk_root = disk_root.decode('utf-8', 'ignore')
-            # Strip and normalize
-            disk_root = (disk_root or '').strip()
-            if platform.system().lower().startswith('win'):
-                # Ensure like 'C:\'
-                if len(disk_root) == 2 and disk_root[1] == ':':
-                    disk_root = disk_root + '\\'
-            disk_root = os.path.normpath(disk_root)
-            if not os.path.isabs(disk_root):
-                disk_root = os.path.abspath(disk_root)
-
-            # Debug prints (console) to verify value
-            print("[server] disk_root=", repr(disk_root), type(disk_root))
-
-            disk = psutil.disk_usage(disk_root)
-        except Exception as disk_err:
-            # Fallback to user's home directory
+            hostname = platform.node()
+            os_info = f"{platform.system()} {platform.release()}"
+            cpu_count = psutil.cpu_count(logical=True)
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
             try:
-                fallback_root = os.path.expanduser('~')
-                fallback_root = os.path.normpath(fallback_root)
-                if not os.path.isabs(fallback_root):
-                    fallback_root = os.path.abspath(fallback_root)
-                print("[server] fallback_root=", repr(fallback_root), type(fallback_root))
-                disk = psutil.disk_usage(fallback_root)
-            except Exception as disk_err2:
-                # Final fallback to OS root
+                disk_root = os.environ.get("DISK_ROOT") or os.getenv('SystemDrive') or os.path.abspath(os.sep)
+                if isinstance(disk_root, bytes):
+                    disk_root = disk_root.decode('utf-8', 'ignore')
+                disk_root = (disk_root or '').strip()
+                if platform.system().lower().startswith('win') and len(disk_root) == 2 and disk_root[1] == ':':
+                    disk_root = disk_root + '\\'
+                disk_root = os.path.normpath(disk_root)
+                if not os.path.isabs(disk_root):
+                    disk_root = os.path.abspath(disk_root)
+                print("[server] disk_root=", repr(disk_root), type(disk_root))
+                disk = psutil.disk_usage(disk_root)
+            except Exception as disk_err:
                 try:
+                    fallback_root = os.path.abspath(os.path.expanduser('~'))
+                    print("[server] fallback_root=", repr(fallback_root), type(fallback_root))
+                    disk = psutil.disk_usage(fallback_root)
+                except Exception as disk_err2:
                     final_root = os.path.abspath(os.sep)
                     print("[server] final_root=", repr(final_root), type(final_root))
                     disk = psutil.disk_usage(final_root)
-                except Exception as disk_err3:
-                    raise RuntimeError(
-                        f"disk_usage_failed primary={repr(disk_root)} err={disk_err} "
-                        f"fallback={repr(fallback_root) if 'fallback_root' in locals() else None} err2={disk_err2} "
-                        f"final={repr(final_root) if 'final_root' in locals() else None} err3={disk_err3}"
-                    )
 
-        # Check common ports
-        common_ports = [22, 80, 443]
-        open_ports = []
-        for port in common_ports:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
-            if sock.connect_ex(('127.0.0.1', port)) == 0:
-                open_ports.append(port)
-            sock.close()
+            open_ports = []
+            for port in [22, 80, 443]:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                if sock.connect_ex(('127.0.0.1', port)) == 0:
+                    open_ports.append(port)
+                sock.close()
 
-        # Store current server stats in database
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO server_monitoring 
-            (hostname, os, cpu_count, cpu_usage, memory_total, memory_used, memory_percent, 
-             disk_total, disk_used, disk_percent, open_ports, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            hostname,
-            os_info,
-            cpu_count,
-            cpu_percent,
-            round(memory.total / (1024**3), 2),
-            round(memory.used / (1024**3), 2),
-            memory.percent,
-            round(disk.total / (1024**3), 2),
-            round(disk.used / (1024**3), 2),
-            round((disk.used / disk.total) * 100, 2),
-            ','.join(map(str, open_ports)),
-            'online'
-        ))
-        conn.commit()
-        conn.close()
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO server_monitoring 
+                (hostname, os, cpu_count, cpu_usage, memory_total, memory_used, memory_percent, 
+                 disk_total, disk_used, disk_percent, open_ports, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                hostname,
+                os_info,
+                cpu_count,
+                cpu_percent,
+                round(memory.total / (1024**3), 2),
+                round(memory.used / (1024**3), 2),
+                memory.percent,
+                round(disk.total / (1024**3), 2),
+                round(disk.used / (1024**3), 2),
+                round((disk.used / disk.total) * 100, 2),
+                ','.join(map(str, open_ports)),
+                'online'
+            ))
+            conn.commit()
+            conn.close()
 
-        server_info = {
-            "hostname": hostname,
-            "os": os_info,
-            "cpu_count": cpu_count,
-            "cpu_usage": f"{cpu_percent}%",
-            "memory_total": f"{round(memory.total / (1024**3),2)} GB",
-            "memory_used": f"{round(memory.used / (1024**3),2)} GB",
-            "memory_percent": f"{memory.percent}%",
-            "disk_total": f"{round(disk.total / (1024**3), 2)} GB",
-            "disk_used": f"{round(disk.used / (1024**3), 2)} GB",
-            "disk_percent": f"{round((disk.used / disk.total) * 100, 2)}%",
-            "open_ports": open_ports
-        }
+            server_info = {
+                "hostname": hostname,
+                "os": os_info,
+                "cpu_count": cpu_count,
+                "cpu_usage": f"{cpu_percent}%",
+                "memory_total": f"{round(memory.total / (1024**3),2)} GB",
+                "memory_used": f"{round(memory.used / (1024**3),2)} GB",
+                "memory_percent": f"{memory.percent}%",
+                "disk_total": f"{round(disk.total / (1024**3), 2)} GB",
+                "disk_used": f"{round(disk.used / (1024**3), 2)} GB",
+                "disk_percent": f"{round((disk.used / disk.total) * 100, 2)}%",
+                "open_ports": open_ports
+            }
+        except Exception as e:
+            server_info = {"error": f"server_info_failure: {type(e).__name__}: {e} | trace: {traceback.format_exc()}"}
+    else:
+        server_info = None
 
-    except Exception as e:
-        # Provide detailed error with traceback to diagnose platform-specific issues
-        server_info = {"error": f"server_info_failure: {type(e).__name__}: {e} | trace: {traceback.format_exc()}"}
-
-    # Load servers list filtered by role/location
+    # Load and ping servers
+    conn = get_db_connection()
+    c = conn.cursor()
     base_sql = "SELECT id, name, ip_address, location, alive, last_ping_at FROM servers"
     params = []
     if user and user["role"] in ("admin", "analytics"):
@@ -613,7 +636,6 @@ def server():
     c.execute(base_sql, params)
     servers = c.fetchall()
 
-    # Auto-ping servers to update alive status and last_ping_at
     for s in servers:
         ip = s["ip_address"]
         count_flag = '-n' if platform.system().lower().startswith('win') else '-c'
@@ -629,7 +651,168 @@ def server():
             pass
     conn.commit()
 
-    # Re-fetch after updates for latest values
+    c.execute(base_sql, params)
+    servers = c.fetchall()
+    conn.close()
+
+    return render_template('server.html', server_info=server_info, servers=servers, locations=get_locations(), user=user)
+
+@app.route('/server/edit/<int:server_id>', methods=['GET', 'POST'])
+@login_required
+@rbac_write_required
+def edit_server(server_id):
+    """Edit server details (name, IP, location) with RBAC location checks"""
+    user = get_current_user()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, name, ip_address, location FROM servers WHERE id=?", (server_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        flash("Server not found.", "danger")
+        return redirect(url_for('server'))
+    # RBAC: view/edit allowed only in location scope for admin/analytics
+    if not user_can_access_location(user, row["location"]):
+        conn.close()
+        flash("Access denied for this location.", "danger")
+        return redirect(url_for('server'))
+
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        ip_address = request.form.get('ip_address', '').strip()
+        location = request.form.get('location', '').strip()
+        if not name or not ip_address:
+            flash("Name and IP address are required.", "warning")
+            conn.close()
+            return redirect(url_for('edit_server', server_id=server_id))
+        if not user_can_access_location(user, location):
+            flash("You cannot set this server's location.", "danger")
+            conn.close()
+            return redirect(url_for('edit_server', server_id=server_id))
+        try:
+            c.execute("UPDATE servers SET name=?, ip_address=?, location=? WHERE id=?", (name, ip_address, location, server_id))
+            conn.commit()
+            flash("Server updated.", "success")
+        except Exception as e:
+            conn.rollback()
+            flash(f"Failed to update server: {e}", "danger")
+        finally:
+            conn.close()
+        return redirect(url_for('server'))
+
+    # GET -> render edit form
+    server_row = {"id": row["id"], "name": row["name"], "ip_address": row["ip_address"], "location": row["location"]}
+    conn.close()
+    return render_template('server_edit.html', server=server_row, locations=get_locations(), user=user)
+
+    # Skip local stats collection by default
+    collect_local = os.environ.get('COLLECT_LOCAL_STATS', '0') == '1'
+    if collect_local:
+        try:
+            hostname = platform.node()
+            os_info = f"{platform.system()} {platform.release()}"
+            cpu_count = psutil.cpu_count(logical=True)
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            try:
+                disk_root = os.environ.get("DISK_ROOT") or os.getenv('SystemDrive') or os.path.abspath(os.sep)
+                if isinstance(disk_root, bytes):
+                    disk_root = disk_root.decode('utf-8', 'ignore')
+                disk_root = (disk_root or '').strip()
+                if platform.system().lower().startswith('win') and len(disk_root) == 2 and disk_root[1] == ':':
+                    disk_root = disk_root + '\\'
+                disk_root = os.path.normpath(disk_root)
+                if not os.path.isabs(disk_root):
+                    disk_root = os.path.abspath(disk_root)
+                print("[server] disk_root=", repr(disk_root), type(disk_root))
+                disk = psutil.disk_usage(disk_root)
+            except Exception as disk_err:
+                try:
+                    fallback_root = os.path.abspath(os.path.expanduser('~'))
+                    print("[server] fallback_root=", repr(fallback_root), type(fallback_root))
+                    disk = psutil.disk_usage(fallback_root)
+                except Exception as disk_err2:
+                    final_root = os.path.abspath(os.sep)
+                    print("[server] final_root=", repr(final_root), type(final_root))
+                    disk = psutil.disk_usage(final_root)
+
+            open_ports = []
+            for port in [22, 80, 443]:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                if sock.connect_ex(('127.0.0.1', port)) == 0:
+                    open_ports.append(port)
+                sock.close()
+
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO server_monitoring 
+                (hostname, os, cpu_count, cpu_usage, memory_total, memory_used, memory_percent, 
+                 disk_total, disk_used, disk_percent, open_ports, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                hostname,
+                os_info,
+                cpu_count,
+                cpu_percent,
+                round(memory.total / (1024**3), 2),
+                round(memory.used / (1024**3), 2),
+                memory.percent,
+                round(disk.total / (1024**3), 2),
+                round(disk.used / (1024**3), 2),
+                round((disk.used / disk.total) * 100, 2),
+                ','.join(map(str, open_ports)),
+                'online'
+            ))
+            conn.commit()
+            conn.close()
+
+            server_info = {
+                "hostname": hostname,
+                "os": os_info,
+                "cpu_count": cpu_count,
+                "cpu_usage": f"{cpu_percent}%",
+                "memory_total": f"{round(memory.total / (1024**3),2)} GB",
+                "memory_used": f"{round(memory.used / (1024**3),2)} GB",
+                "memory_percent": f"{memory.percent}%",
+                "disk_total": f"{round(disk.total / (1024**3), 2)} GB",
+                "disk_used": f"{round(disk.used / (1024**3), 2)} GB",
+                "disk_percent": f"{round((disk.used / disk.total) * 100, 2)}%",
+                "open_ports": open_ports
+            }
+        except Exception as e:
+            server_info = {"error": f"server_info_failure: {type(e).__name__}: {e} | trace: {traceback.format_exc()}"}
+    else:
+        server_info = None
+
+    # Load and ping servers
+    conn = get_db_connection()
+    c = conn.cursor()
+    base_sql = "SELECT id, name, ip_address, location, alive, last_ping_at FROM servers"
+    params = []
+    if user and user["role"] in ("admin", "analytics"):
+        base_sql += " WHERE LOWER(location)=LOWER(?)"
+        params.append(user["location"] or "")
+    base_sql += " ORDER BY name"
+    c.execute(base_sql, params)
+    servers = c.fetchall()
+
+    for s in servers:
+        ip = s["ip_address"]
+        count_flag = '-n' if platform.system().lower().startswith('win') else '-c'
+        try:
+            result = subprocess.run(['ping', count_flag, '1', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+            alive = 1 if result.returncode == 0 else 0
+        except Exception:
+            alive = 0
+        now_dt = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+        try:
+            c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now_dt, s["id"]))
+        except Exception:
+            pass
+    conn.commit()
+
     c.execute(base_sql, params)
     servers = c.fetchall()
     conn.close()
@@ -667,6 +850,36 @@ def ping_server(server_id):
     conn.commit()
     conn.close()
     flash(f"Ping {'success' if alive else 'failed'} for {ip}.", "info")
+    return redirect(url_for('server'))
+
+@app.route('/server/delete/<int:server_id>', methods=['POST'])
+@login_required
+@rbac_write_required
+def delete_server(server_id):
+    """Delete a server by ID with RBAC location checks"""
+    user = get_current_user()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, name, location FROM servers WHERE id=?", (server_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        flash("Server not found.", "danger")
+        return redirect(url_for('server'))
+    # RBAC: Admin/Analytics limited to their location
+    if not user_can_access_location(user, row["location"]):
+        conn.close()
+        flash("Access denied for this location.", "danger")
+        return redirect(url_for('server'))
+    try:
+        c.execute("DELETE FROM servers WHERE id=?", (server_id,))
+        conn.commit()
+        flash(f"Deleted server '{row['name']}'.", "success")
+    except Exception as e:
+        conn.rollback()
+        flash(f"Failed to delete server: {e}", "danger")
+    finally:
+        conn.close()
     return redirect(url_for('server'))
 
 @app.route('/api/servers/status')
@@ -709,6 +922,37 @@ def api_servers_status():
     conn.commit()
     conn.close()
     return jsonify({"servers": statuses})
+
+@app.route('/domain/delete/<path:domain_name>', methods=['POST'])
+@login_required
+@rbac_write_required
+def delete_domain(domain_name):
+    """Delete a domain by name along with its alerts, with RBAC location checks"""
+    user = get_current_user()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT name, location FROM domains WHERE name=?", (domain_name,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        flash("Domain not found.", "danger")
+        return redirect(url_for('domain'))
+    if not user_can_access_location(user, row["location"]):
+        conn.close()
+        flash("Access denied for this location.", "danger")
+        return redirect(url_for('domain'))
+    try:
+        # Delete alerts first due to FK-like relationship
+        c.execute("DELETE FROM domain_alerts WHERE domain_name=?", (row["name"],))
+        c.execute("DELETE FROM domains WHERE name=?", (row["name"],))
+        conn.commit()
+        flash(f"Deleted domain '{row['name']}'.", "success")
+    except Exception as e:
+        conn.rollback()
+        flash(f"Failed to delete domain: {e}", "danger")
+    finally:
+        conn.close()
+    return redirect(url_for('domain'))
 
 @app.route('/server/history')
 @login_required
