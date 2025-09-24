@@ -1,4 +1,4 @@
-﻿from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback, threading, time
 from email.message import EmailMessage
 
@@ -23,6 +23,23 @@ def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
+
+# Cross-platform ping helper
+def ping_host(target: str, timeout_seconds: int = 3) -> bool:
+    """Ping target once and return True if reachable.
+    Windows: ping -n 1 -w <ms>
+    Unix:    ping -c 1 -W <sec>
+    """
+    try:
+        is_win = platform.system().lower().startswith('win')
+        count_flag = '-n' if is_win else '-c'
+        timeout_flag = '-w' if is_win else '-W'
+        timeout_value = str(int(timeout_seconds * 1000)) if is_win else str(int(timeout_seconds))
+        cmd = ['ping', count_flag, '1', timeout_flag, timeout_value, target]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_seconds + 2)
+        return result.returncode == 0
+    except Exception:
+        return False
 
 # ---------- DB Migration Helpers ----------
 def ensure_alerts_schema():
@@ -669,7 +686,7 @@ def server():
     else:
         server_info = None
 
-    # Load and ping servers
+    # Load servers
     conn = get_db_connection()
     c = conn.cursor()
     base_sql = "SELECT id, name, ip_address, location, alive, last_ping_at FROM servers"
@@ -678,24 +695,6 @@ def server():
         base_sql += " WHERE LOWER(location)=LOWER(?)"
         params.append(user["location"] or "")
     base_sql += " ORDER BY name"
-    c.execute(base_sql, params)
-    servers = c.fetchall()
-
-    for s in servers:
-        ip = s["ip_address"]
-        count_flag = '-n' if platform.system().lower().startswith('win') else '-c'
-        try:
-            result = subprocess.run(['ping', count_flag, '1', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-            alive = 1 if result.returncode == 0 else 0
-        except Exception:
-            alive = 0
-        now_dt = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
-        try:
-            c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now_dt, s["id"]))
-        except Exception:
-            pass
-    conn.commit()
-
     c.execute(base_sql, params)
     servers = c.fetchall()
     conn.close()
@@ -882,13 +881,8 @@ def ping_server(server_id):
         return redirect(url_for('server'))
 
     ip = row["ip_address"]
-    # Cross-platform ping: Windows uses '-n 1', Linux/macOS use '-c 1'
-    count_flag = '-n' if platform.system().lower().startswith('win') else '-c'
-    try:
-        result = subprocess.run(['ping', count_flag, '1', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-        alive = 1 if result.returncode == 0 else 0
-    except Exception:
-        alive = 0
+    # Use helper
+    alive = 1 if ping_host(ip, timeout_seconds=3) else 0
 
     now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
     c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now, server_id))
@@ -1234,6 +1228,7 @@ def api_delete_server_alert_email(server_id):
 # Background watcher for offline/online alerts
 _watcher_thread_started = False
 _prev_offline = {}
+_pinger_thread_started = False
 
 def _send_server_email(recipients, subject, body):
     return send_email_smtp(recipients, subject, body)
@@ -1284,8 +1279,8 @@ def _watch_servers_and_alert(interval_seconds=60, repeat_minutes=5, send_recover
                 else:
                     # Recovery path if previously offline
                     if _prev_offline.get(sid) and send_recovery and alerts:
-                        subject = f"[RECOVERY] Server Offline: {s['name']}"
-                        body = _format_server_summary(s) + f"\nStatus: Online\nTimestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}\nServer offline."
+                        subject = f"[RECOVERY] Server ONLINE: {s['name']}"
+                        body = _format_server_summary(s) + f"\nStatus: Online\nTimestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}\nServer is back online."
                         for a in alerts:
                             email = a[0]
                             _send_server_email(email, subject, body)
@@ -1301,13 +1296,43 @@ def _watch_servers_and_alert(interval_seconds=60, repeat_minutes=5, send_recover
         time.sleep(interval_seconds)
 
 def _start_watcher_once():
-    global _watcher_thread_started
+    global _watcher_thread_started, _pinger_thread_started
+    # Avoid double start under Flask reloader
+    if os.environ.get('WERKZEUG_RUN_MAIN') not in ('true', 'True') and app.debug:
+        return
     if not _watcher_thread_started:
         t = threading.Thread(target=_watch_servers_and_alert, kwargs={"interval_seconds": 60, "repeat_minutes": 5, "send_recovery": True}, daemon=True)
         t.start()
         _watcher_thread_started = True
+    if not _pinger_thread_started:
+        p = threading.Thread(target=_background_ping_loop, kwargs={"interval_seconds": 3}, daemon=True)
+        p.start()
+        _pinger_thread_started = True
+
+def _background_ping_loop(interval_seconds=3):
+    while True:
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("SELECT id, ip_address FROM servers")
+            rows = c.fetchall()
+            now_dt = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+            for r in rows:
+                sid = r["id"]
+                ip = r["ip_address"]
+                alive = 1 if ping_host(ip, timeout_seconds=1) else 0
+                try:
+                    c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now_dt, sid))
+                except Exception:
+                    pass
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print("[pinger] error:", e)
+        time.sleep(interval_seconds)
 
 if __name__ == '__main__':
     _start_watcher_once()
+    # Prevent double threads: rely on WERKZEUG_RUN_MAIN guard in _start_watcher_once
     app.run(debug=True, host='0.0.0.0', port=5000)
 
