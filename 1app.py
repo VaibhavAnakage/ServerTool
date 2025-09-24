@@ -1229,6 +1229,8 @@ def api_delete_server_alert_email(server_id):
 _watcher_thread_started = False
 _prev_offline = {}
 _pinger_thread_started = False
+_ping_failures = {}
+_ping_successes = {}
 
 def _send_server_email(recipients, subject, body):
     return send_email_smtp(recipients, subject, body)
@@ -1320,11 +1322,49 @@ def _background_ping_loop(interval_seconds=3):
             for r in rows:
                 sid = r["id"]
                 ip = r["ip_address"]
-                alive = 1 if ping_host(ip, timeout_seconds=1) else 0
+                result_alive = 1 if ping_host(ip, timeout_seconds=1) else 0
+                # Get current known state from DB
                 try:
-                    c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now_dt, sid))
+                    c.execute("SELECT alive FROM servers WHERE id=?", (sid,))
+                    row_state = c.fetchone()
+                    current_alive = int(row_state[0] or 0) if row_state is not None else 0
                 except Exception:
-                    pass
+                    current_alive = 0
+
+                # Hysteresis: require 2 consecutive opposite results to flip
+                changed = False
+                if current_alive == 1:
+                    if result_alive == 1:
+                        _ping_failures[sid] = 0
+                    else:
+                        _ping_failures[sid] = _ping_failures.get(sid, 0) + 1
+                        if _ping_failures[sid] >= 2:
+                            current_alive = 0
+                            _ping_failures[sid] = 0
+                            _ping_successes[sid] = 0
+                            changed = True
+                else:  # currently offline
+                    if result_alive == 0:
+                        _ping_successes[sid] = 0
+                    else:
+                        _ping_successes[sid] = _ping_successes.get(sid, 0) + 1
+                        if _ping_successes[sid] >= 2:
+                            current_alive = 1
+                            _ping_successes[sid] = 0
+                            _ping_failures[sid] = 0
+                            changed = True
+
+                # Always update last_ping_at, and alive only if changed
+                if changed:
+                    try:
+                        c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (current_alive, now_dt, sid))
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        c.execute("UPDATE servers SET last_ping_at=? WHERE id=?", (now_dt, sid))
+                    except Exception:
+                        pass
             conn.commit()
             conn.close()
         except Exception as e:
