@@ -1748,6 +1748,170 @@ def api_server_status_latest():
     conn.close()
     return jsonify({"server_status": rows})
 
+# Time-series APIs for charts
+@app.route('/api/server-status/history')
+@login_required
+def api_server_status_history():
+    """Return time-series points (ts, cpu, mem) for Linux metrics for a server_id."""
+    user = get_current_user()
+    server_id = request.args.get('server_id', type=int)
+    limit = request.args.get('limit', default=500, type=int)
+    since_minutes = request.args.get('since_minutes', type=int)
+    if not server_id:
+        return jsonify({"error": "server_id required"}), 400
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT location FROM servers WHERE id=?", (server_id,))
+    r = c.fetchone()
+    if not r:
+        conn.close(); return jsonify({"error": "server not found"}), 404
+    if not user_can_access_location(user, r[0]):
+        conn.close(); return jsonify({"error": "access denied"}), 403
+    sql = """
+        SELECT last_updated, cpu_usage, memory_usage
+        FROM server_status
+        WHERE server_id=?
+    """
+    params = [server_id]
+    if since_minutes is not None and since_minutes > 0:
+        # Compute threshold timestamp in server format (seconds precision is fine)
+        threshold = datetime.datetime.now() - datetime.timedelta(minutes=since_minutes)
+        threshold_str = threshold.isoformat(sep=' ', timespec='seconds')
+        sql += " AND last_updated >= ?"
+        params.append(threshold_str)
+    sql += " ORDER BY last_updated ASC LIMIT ?"
+    params.append(max(1, min(5000, limit)))
+    c.execute(sql, params)
+    points = [{"ts": row[0], "cpu": row[1], "mem": row[2]} for row in c.fetchall()]
+    conn.close()
+    return jsonify({"server_id": server_id, "points": points})
+
+@app.route('/api/server-status/history-all')
+@login_required
+def api_server_status_history_all():
+    """Return time-series for all accessible servers, combining Linux/Windows where available.
+    Query params: since_minutes (optional), limit (default 500 per server)
+    Output: { servers: [ {server_id, name, points:[{ts,cpu,mem}]} ] }
+    """
+    user = get_current_user()
+    since_minutes = request.args.get('since_minutes', type=int)
+    limit = request.args.get('limit', default=500, type=int)
+    limit = max(50, min(5000, limit))
+
+    conn = get_db_connection(); c = conn.cursor()
+    base_sql = "SELECT id, name, location FROM servers"
+    params = []
+    if user and user["role"] in ("admin", "analytics"):
+        base_sql += " WHERE LOWER(location)=LOWER(?)"
+        params.append(user["location"] or "")
+    base_sql += " ORDER BY name"
+    c.execute(base_sql, params)
+    servers = c.fetchall()
+
+    # Build threshold
+    threshold_str = None
+    if since_minutes and since_minutes > 0:
+        threshold = datetime.datetime.now() - datetime.timedelta(minutes=since_minutes)
+        threshold_str = threshold.isoformat(sep=' ', timespec='seconds')
+
+    out = []
+    for s in servers:
+        sid, name, loc = s[0], s[1], s[2]
+        # Linux
+        sql_l = "SELECT last_updated, cpu_usage, memory_usage FROM server_status WHERE server_id=?"
+        params_l = [sid]
+        if threshold_str:
+            sql_l += " AND last_updated >= ?"
+            params_l.append(threshold_str)
+        sql_l += " ORDER BY last_updated ASC LIMIT ?"
+        params_l.append(limit)
+        c.execute(sql_l, params_l)
+        lrows = c.fetchall()
+        # Windows
+        sql_w = "SELECT last_updated, cpu_usage, memory_usage FROM server_status_windows WHERE server_id=?"
+        params_w = [sid]
+        if threshold_str:
+            sql_w += " AND last_updated >= ?"
+            params_w.append(threshold_str)
+        sql_w += " ORDER BY last_updated ASC LIMIT ?"
+        params_w.append(limit)
+        c.execute(sql_w, params_w)
+        wrows = c.fetchall()
+
+        # Merge by timestamp (string equality). If both present, prefer Windows values.
+        m = {}
+        for r in lrows:
+            m[r[0]] = {"ts": r[0], "cpu": r[1], "mem": r[2]}
+        for r in wrows:
+            m[r[0]] = {"ts": r[0], "cpu": r[1], "mem": r[2]}
+        points = [m[k] for k in sorted(m.keys())]
+        if points:
+            out.append({"server_id": sid, "name": name, "points": points})
+
+    conn.close()
+    return jsonify({"servers": out})
+
+@app.route('/server/trends')
+@login_required
+def server_trends():
+    """All servers CPU/Memory trends page."""
+    user = get_current_user()
+    return render_template('server_trends.html', user=user)
+
+@app.route('/api/server-status/history-windows')
+@login_required
+def api_server_status_history_windows():
+    """Return time-series points (ts, cpu, mem) for Windows metrics for a server_id."""
+    user = get_current_user()
+    server_id = request.args.get('server_id', type=int)
+    limit = request.args.get('limit', default=500, type=int)
+    since_minutes = request.args.get('since_minutes', type=int)
+    if not server_id:
+        return jsonify({"error": "server_id required"}), 400
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT location FROM servers WHERE id=?", (server_id,))
+    r = c.fetchone()
+    if not r:
+        conn.close(); return jsonify({"error": "server not found"}), 404
+    if not user_can_access_location(user, r[0]):
+        conn.close(); return jsonify({"error": "access denied"}), 403
+    sql = """
+        SELECT last_updated, cpu_usage, memory_usage
+        FROM server_status_windows
+        WHERE server_id=?
+    """
+    params = [server_id]
+    if since_minutes is not None and since_minutes > 0:
+        threshold = datetime.datetime.now() - datetime.timedelta(minutes=since_minutes)
+        threshold_str = threshold.isoformat(sep=' ', timespec='seconds')
+        sql += " AND last_updated >= ?"
+        params.append(threshold_str)
+    sql += " ORDER BY last_updated ASC LIMIT ?"
+    params.append(max(1, min(5000, limit)))
+    c.execute(sql, params)
+    points = [{"ts": row[0], "cpu": row[1], "mem": row[2]} for row in c.fetchall()]
+    conn.close()
+    return jsonify({"server_id": server_id, "points": points})
+
+@app.route('/server/<int:server_id>')
+@login_required
+def server_detail(server_id):
+    """Server detail page with info and CPU/memory graphs."""
+    user = get_current_user()
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT id, name, ip_address, location, alive, last_ping_at FROM servers WHERE id=?", (server_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        flash("Server not found.", "danger")
+        return redirect(url_for('server'))
+    if not user_can_access_location(user, row[3]):
+        conn.close()
+        flash("Access denied for this location.", "danger")
+        return redirect(url_for('server'))
+    info = {"id": row[0], "name": row[1], "ip_address": row[2], "location": row[3], "alive": bool(row[4]), "last_ping_at": row[5]}
+    conn.close()
+    return render_template('server_detail.html', server=info, user=user)
+
 @app.route('/api/server-status/latest-windows')
 @login_required
 def api_server_status_latest_windows():

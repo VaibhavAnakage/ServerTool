@@ -121,6 +121,7 @@
             <h2>Quick Actions</h2>
             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                 <a href="/server/history" class="btn btn-primary">View History</a>
+                <a href="/server/trends" class="btn btn-primary">All Servers Trends</a>
                 <button onclick="location.reload()" class="btn btn-secondary">Refresh Data</button>
                 <a href="/run_alerts" class="btn btn-success">Run Alerts</a>
             </div>
@@ -294,7 +295,7 @@
                 const name = item.name || ('#' + item.server_id);
                 return `
                     <tr>
-                        <td>${name}</td>
+                        <td><a href="/server/${item.server_id}">${name}</a></td>
                         <td>${cpu}</td>
                         <td>${mem}</td>
                         <td>${tdisk}</td>
@@ -330,7 +331,7 @@
                 const name = item.name || ('#' + item.server_id);
                 return `
                     <tr>
-                        <td>${name}</td>
+                        <td><a href="/server/${item.server_id}">${name}</a></td>
                         <td>${cpu}</td>
                         <td>${mem}</td>
                         <td>${drives}</td>

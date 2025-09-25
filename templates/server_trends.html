@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>All Servers Trends</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:16px; }
+    .srv-card { padding:12px; border:1px solid #e5e7eb; border-radius:8px; background:#fff; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .srv-title { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+    .badge { font-size: 12px; padding:2px 6px; border-radius: 6px; }
+    .badge-online { background:#dcfce7; color:#166534; }
+    .badge-offline { background:#fee2e2; color:#991b1b; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>All Servers Trends</h1>
+    </div>
+  </header>
+  <nav>
+    <div class="container">
+      <ul>
+        <li><a href="/">Dashboard</a></li>
+        <li><a href="/server">Server Info</a></li>
+        <li><a href="/server/history">Server History</a></li>
+        <li style="margin-left:auto"><a href="/logout">Logout ({{ user.name if user else '' }})</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <div class="container">
+    <div class="card" style="margin-bottom:12px;">
+      <h2>Controls</h2>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <label for="rangeSelect"><strong>Range:</strong></label>
+        <select id="rangeSelect" class="form-control" style="min-width:140px;">
+          <option value="60">Last 1 hour</option>
+          <option value="360">Last 6 hours</option>
+          <option value="1440" selected>Last 24 hours</option>
+          <option value="10080">Last 7 days</option>
+          <option value="">All</option>
+        </select>
+        <label for="limitInput"><strong>Max points/server:</strong></label>
+        <input type="number" id="limitInput" class="form-control" value="500" min="50" max="5000" step="50" style="width:120px;">
+        <button id="applyBtn" class="btn btn-primary">Apply</button>
+        <label style="display:flex; align-items:center; gap:6px; margin-left:16px;">
+          <input type="checkbox" id="autoRefreshCbx" checked>
+          Auto-refresh (30s)
+        </label>
+      </div>
+      <p id="statusNote" style="color:#666; margin:6px 0 0 0;">Loading...</p>
+    </div>
+
+    <div id="chartsGrid" class="grid"></div>
+  </div>
+
+<script>
+(function(){
+  const grid = document.getElementById('chartsGrid');
+  const note = document.getElementById('statusNote');
+  const charts = new Map(); // server_id -> {cpuMemChart}
+
+  function mkCanvas(id){
+    const c = document.createElement('canvas');
+    c.id = id;
+    c.width = 100; c.height = 50;
+    c.style.width = '100px';
+    c.style.height = '50px';
+    c.style.display = 'block';
+    return c;
+  }
+
+  function mkCard(server){
+    const wrap = document.createElement('div');
+    wrap.className = 'srv-card';
+
+    const title = document.createElement('div');
+    title.className = 'srv-title';
+    const name = document.createElement('a');
+    name.textContent = server.name || ('#'+server.server_id);
+    name.href = `/server/${server.server_id}`;
+    const badge = document.createElement('span');
+    badge.className = 'badge badge-online';
+    badge.textContent = 'Trends';
+
+    title.appendChild(name);
+    title.appendChild(badge);
+
+    const canvas = mkCanvas('cm_'+server.server_id);
+
+    wrap.appendChild(title);
+    wrap.appendChild(canvas);
+    return {wrap, canvas};
+  }
+
+  function mkChart(canvas){
+    const ctx = canvas.getContext('2d');
+    return new Chart(ctx, {
+      type: 'line',
+      data: { labels: [], datasets: [
+        { label:'CPU %', borderColor:'#2563eb', backgroundColor:'rgba(37,99,235,0.15)', data: [], tension:0.25, spanGaps:true, pointRadius:0 },
+        { label:'Mem %', borderColor:'#16a34a', backgroundColor:'rgba(22,163,74,0.15)', data: [], tension:0.25, spanGaps:true, pointRadius:0 }
+      ]},
+      options: {
+        responsive: false,
+        maintainAspectRatio: false,
+        interaction: { mode:'index', intersect:false },
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: {
+            label: function(ctx){
+              const v = ctx.parsed.y;
+              return `${ctx.dataset.label}: ${v == null ? '-' : v.toFixed ? v.toFixed(1) : v}%`;
+            }
+          }}
+        },
+        scales: {
+          x: { ticks: { autoSkip:true, maxTicksLimit:6 } },
+          y: { beginAtZero:true, max:100 }
+        }
+      }
+    });
+  }
+
+  async function fetchJson(url){ const r = await fetch(url, {credentials:'same-origin'}); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+
+  async function load(){
+    const limit = Math.max(50, Math.min(5000, parseInt(document.getElementById('limitInput').value || '500', 10)));
+    const since = document.getElementById('rangeSelect').value;
+    const qs = `?limit=${encodeURIComponent(limit)}${since ? `&since_minutes=${encodeURIComponent(since)}`:''}`;
+    note.textContent = 'Loading...';
+    let data;
+    try{
+      data = await fetchJson('/api/server-status/history-all'+qs);
+    }catch(e){
+      note.textContent = 'Failed to load data.'; return;
+    }
+    const list = data.servers || [];
+    note.textContent = list.length ? `Loaded ${list.length} servers.` : 'No data to display.';
+
+    // Create/Update cards
+    const seen = new Set();
+    list.forEach(s => {
+      seen.add(String(s.server_id));
+      let entry = charts.get(String(s.server_id));
+      if(!entry){
+        const {wrap, canvas} = mkCard(s);
+        grid.appendChild(wrap);
+        const chart = mkChart(canvas);
+        entry = { wrap, chart };
+        charts.set(String(s.server_id), entry);
+      }
+      const labels = s.points.map(p => p.ts);
+      const cpu = s.points.map(p => p.cpu);
+      const mem = s.points.map(p => p.mem);
+      entry.chart.data.labels = labels;
+      entry.chart.data.datasets[0].data = cpu;
+      entry.chart.data.datasets[1].data = mem;
+      entry.chart.update();
+    });
+
+    // Remove cards not in latest payload
+    Array.from(charts.keys()).forEach(k => {
+      if(!seen.has(k)){
+        const entry = charts.get(k);
+        if(entry && entry.wrap && entry.wrap.parentNode){ entry.wrap.parentNode.removeChild(entry.wrap); }
+        charts.delete(k);
+      }
+    });
+  }
+
+  document.getElementById('applyBtn').addEventListener('click', load);
+  setInterval(function(){ const cb = document.getElementById('autoRefreshCbx'); if(cb && cb.checked) load(); }, 30000);
+
+  load();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Server Detail - {{ server.name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>Server Detail: {{ server.name }}</h1>
+    </div>
+  </header>
+
+  <nav>
+    <div class="container">
+      <ul>
+        <li><a href="/">Dashboard</a></li>
+        <li><a href="/server">Server Info</a></li>
+        <li><a href="/server/history">Server History</a></li>
+        <li style="margin-left:auto"><a href="/logout">Logout ({{ user.name if user else '' }})</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h2>Overview</h2>
+      <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px;">
+        <div class="card">
+          <h3>Identity</h3>
+          <ul style="list-style:none; padding:0;">
+            <li><strong>ID:</strong> {{ server.id }}</li>
+            <li><strong>Name:</strong> {{ server.name }}</li>
+            <li><strong>IP:</strong> {{ server.ip_address }}</li>
+            <li><strong>Location:</strong> {{ server.location or '-' }}</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Status</h3>
+          <ul style="list-style:none; padding:0;">
+            <li><strong>Alive:</strong> {% if server.alive %}<span class="badge badge-success">Online</span>{% else %}<span class="badge badge-danger">Offline</span>{% endif %}</li>
+            <li><strong>Last Ping:</strong> {{ server.last_ping_at or '-' }}</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>CPU & Memory Utilization</h2>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+        <label for="rangeSelect"><strong>Range:</strong></label>
+        <select id="rangeSelect" class="form-control" style="min-width:140px;">
+          <option value="60">Last 1 hour</option>
+          <option value="360">Last 6 hours</option>
+          <option value="1440" selected>Last 24 hours</option>
+          <option value="10080">Last 7 days</option>
+          <option value="">All</option>
+        </select>
+        <label for="limitInput"><strong>Max points:</strong></label>
+        <input type="number" id="limitInput" class="form-control" value="500" min="50" max="5000" step="50" style="width:110px;">
+        <button id="applyBtn" class="btn btn-primary">Apply</button>
+        <label style="display:flex; align-items:center; gap:6px; margin-left:16px;">
+          <input type="checkbox" id="autoRefreshCbx" checked>
+          Auto-refresh (30s)
+        </label>
+      </div>
+      <p id="series-note" style="margin-top:-6px; color:#666;">Loading time-series...</p>
+      <div class="card" style="padding:8px;">
+        <h3>CPU% and Memory% (combined)</h3>
+        <canvas id="cmChart" width="800" height="400" style="width:800px;height:400px;display:block;"></canvas>
+      </div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  const serverId = {{ server.id }};
+  const cmCtx = document.getElementById('cmChart').getContext('2d');
+  const noteEl = document.getElementById('series-note');
+
+  let cmChart;
+
+  function mkLine(ctx, datasets) {
+    return new Chart(ctx, {
+      type: 'line',
+      data: { labels: [], datasets },
+      options: {
+        responsive: false,
+        maintainAspectRatio: false,
+        elements: { point: { radius: 0 } },
+        scales: {
+          x: { ticks: { autoSkip: true, maxTicksLimit: 10 } },
+          y: { beginAtZero: true, max: 100 }
+        },
+        plugins: { legend: { display: false } }
+      }
+    });
+  }
+
+  function fmtTs(ts) {
+    return ts; // already formatted string from server
+  }
+
+  function upsertData(chart, labels, series) {
+    chart.data.labels = labels;
+    chart.data.datasets = series;
+    chart.update();
+  }
+
+  async function fetchJson(url){
+    const res = await fetch(url, { credentials:'same-origin' });
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    return res.json();
+  }
+
+  async function loadData(){
+    try{
+      const limitEl = document.getElementById('limitInput');
+      const rangeEl = document.getElementById('rangeSelect');
+      const limit = Math.max(50, Math.min(5000, parseInt(limitEl.value || '500', 10)));
+      const since = rangeEl.value;
+      const sinceQS = since ? `&since_minutes=${encodeURIComponent(since)}` : '';
+
+      const [linux, win] = await Promise.all([
+        fetchJson(`/api/server-status/history?server_id=${serverId}&limit=${limit}${sinceQS}`).catch(()=>({points:[]})),
+        fetchJson(`/api/server-status/history-windows?server_id=${serverId}&limit=${limit}${sinceQS}`).catch(()=>({points:[]})),
+      ]);
+
+      const lpts = linux.points || [];
+      const wpts = win.points || [];
+
+      const hasLinux = lpts.length > 0;
+      const hasWindows = wpts.length > 0;
+
+      if(!hasLinux && !hasWindows){
+        noteEl.textContent = 'No time-series data found yet for this server.';
+      } else if (hasLinux && hasWindows){
+        noteEl.textContent = 'Showing both Linux and Windows series (if overlaps exist).';
+      } else {
+        noteEl.textContent = hasLinux ? 'Showing Linux series.' : 'Showing Windows series.';
+      }
+
+      // Build combined x-axis by union of timestamps
+      const tsSet = new Set();
+      lpts.forEach(p=>tsSet.add(p.ts));
+      wpts.forEach(p=>tsSet.add(p.ts));
+      const labels = Array.from(tsSet).sort();
+
+      const lCpuMap = new Map(lpts.map(p=>[p.ts, p.cpu]));
+      const wCpuMap = new Map(wpts.map(p=>[p.ts, p.cpu]));
+      const lMemMap = new Map(lpts.map(p=>[p.ts, p.mem]));
+      const wMemMap = new Map(wpts.map(p=>[p.ts, p.mem]));
+
+      // Datasets
+      const datasets = [];
+      if(hasLinux){
+        datasets.push({ label:'CPU Linux', data: labels.map(t=>lCpuMap.get(t) ?? null), borderColor:'#2563eb', backgroundColor:'rgba(37,99,235,0.15)', tension:0.25, spanGaps:true });
+        datasets.push({ label:'Mem Linux', data: labels.map(t=>lMemMap.get(t) ?? null), borderColor:'#16a34a', backgroundColor:'rgba(22,163,74,0.15)', tension:0.25, spanGaps:true });
+      }
+      if(hasWindows){
+        datasets.push({ label:'CPU Windows', data: labels.map(t=>wCpuMap.get(t) ?? null), borderColor:'#db2777', backgroundColor:'rgba(219,39,119,0.15)', tension:0.25, spanGaps:true });
+        datasets.push({ label:'Mem Windows', data: labels.map(t=>wMemMap.get(t) ?? null), borderColor:'#f59e0b', backgroundColor:'rgba(245,158,11,0.15)', tension:0.25, spanGaps:true });
+      }
+      if(!cmChart) cmChart = mkLine(cmCtx, datasets);
+      upsertData(cmChart, labels.map(fmtTs), datasets);
+
+    }catch(e){
+      noteEl.textContent = 'Failed to load time-series data.';
+    }
+  }
+
+  loadData();
+
+  // Apply button triggers reload
+  document.getElementById('applyBtn').addEventListener('click', function(){
+    loadData();
+  });
+
+  // Auto-refresh every 30s when enabled
+  setInterval(function(){
+    const cb = document.getElementById('autoRefreshCbx');
+    if(cb && cb.checked){ loadData(); }
+  }, 30000);
+})();
+</script>
+</body>
+</html>
