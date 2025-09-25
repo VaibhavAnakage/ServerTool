@@ -389,6 +389,7 @@
         openAlertEmails(sid, sname);
     });
 
+
     async function loadAlertEmails(serverId){
         try{
             const res = await fetch(`/api/server-alerts/${serverId}`, {credentials:'same-origin'});
@@ -435,6 +436,7 @@
             }
         }catch(e){}
     }
+
     </script>
 </body>
 </html>

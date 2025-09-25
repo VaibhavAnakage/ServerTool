@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Linux Systems Data</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <style>
+    :root { --border:#e5e7eb; --muted:#6b7280; --mono: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; }
+    .container{ width:min(1200px,94%); margin:16px auto; }
+    .controls{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+    .card{ background:#fff; border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:16px; }
+    .grid{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:16px; }
+    @media (max-width:900px){ .grid{ grid-template-columns:1fr; } }
+    .table-wrap{ border:1px solid var(--border); border-radius:8px; overflow:auto; }
+    table{ width:100%; border-collapse:collapse; font-size:13px; }
+    thead th{ text-align:left; padding:8px; background:#f1f5f9; border-bottom:1px solid var(--border); white-space:nowrap; }
+    tbody td{ padding:8px; border-bottom:1px solid var(--border); white-space:nowrap; }
+    .mono{ font-family:var(--mono); white-space:pre-wrap; }
+    .muted{ color:var(--muted); }
+    .section h2{ margin:0 0 10px; font-size:18px; border-left:4px solid #2563eb; padding-left:8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>Linux Systems Data</h1>
+    </div>
+  </header>
+  <nav>
+    <div class="container">
+      <ul>
+        <li><a href="/">Dashboard</a></li>
+        <li><a href="/server">Server Info</a></li>
+        <li style="margin-left:auto" class="muted">Viewer</li>
+      </ul>
+    </div>
+  </nav>
+
+  <div class="container">
+    <div class="controls card">
+      <label for="hostInput"><strong>Hostname:</strong></label>
+      <input id="hostInput" class="form-control" placeholder="optional hostname filter" style="min-width:200px;">
+      <label for="limitInput"><strong>Limit:</strong></label>
+      <input id="limitInput" type="number" class="form-control" value="1" min="1" max="20" style="width:90px;">
+      <button id="loadBtn" class="btn btn-primary">Load</button>
+      <span id="status" class="muted"></span>
+    </div>
+
+    <div id="result"></div>
+  </div>
+
+<script>
+(function(){
+  const elRes = document.getElementById('result');
+  const elStatus = document.getElementById('status');
+
+  function h(str){ return String(str == null ? '-' : str); }
+
+  function mkTable(headers, rows){
+    const wrap = document.createElement('div'); wrap.className = 'table-wrap';
+    const t = document.createElement('table');
+    const thead = document.createElement('thead'); const trh = document.createElement('tr');
+    headers.forEach(hd => { const th=document.createElement('th'); th.textContent=hd; trh.appendChild(th); });
+    thead.appendChild(trh); t.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    rows.forEach(r => {
+      const tr=document.createElement('tr');
+      r.forEach(c => { const td=document.createElement('td'); td.textContent=c; tr.appendChild(td); });
+      tbody.appendChild(tr);
+    });
+    t.appendChild(tbody); wrap.appendChild(t); return wrap;
+  }
+
+  function section(title){
+    const card = document.createElement('div'); card.className = 'card section';
+    const h2 = document.createElement('h2'); h2.textContent = title; card.appendChild(h2);
+    return card;
+  }
+
+  function renderItem(item){
+    const frag = document.createDocumentFragment();
+
+    // System Info
+    let sec = section('System Info');
+    const sysGrid = document.createElement('div'); sysGrid.className = 'grid';
+    const sysLeft = document.createElement('div'); sysLeft.className = 'card'; sysLeft.style.padding = '12px';
+    sysLeft.innerHTML = `
+      <div><strong>Hostname:</strong> ${h(item.hostname)}</div>
+      <div><strong>Date/Time:</strong> ${h(item.date_time)}</div>
+      <div><strong>Kernel:</strong> ${h(item.kernel_version)}</div>
+      <div><strong>Architecture:</strong> ${h(item.architecture)}</div>
+    `;
+    const sysRight = document.createElement('div'); sysRight.className = 'card'; sysRight.style.padding = '12px';
+    sysRight.innerHTML = `
+      <div><strong>Uptime:</strong> ${h(item.uptime)}</div>
+      <div class="mono" style="margin-top:8px;"><strong>OS Info</strong>\n${h(item.os_info)}</div>
+    `;
+    sysGrid.appendChild(sysLeft); sysGrid.appendChild(sysRight); sec.appendChild(sysGrid);
+    frag.appendChild(sec);
+
+    // Performance
+    sec = section('Performance');
+    const perfGrid = document.createElement('div'); perfGrid.className = 'grid';
+    const perfLeft = document.createElement('div'); perfLeft.className = 'card'; perfLeft.style.padding='12px';
+    perfLeft.innerHTML = `<h3>CPU</h3><div class="mono">${h(item.cpu && item.cpu.cpu_model)} | cores:${h(item.cpu && item.cpu.cores)} threads:${h(item.cpu && item.cpu.threads)} speed:${h(item.cpu && item.cpu.cpu_speed_mhz)} MHz</div>`;
+    const perfRight = document.createElement('div'); perfRight.className='card'; perfRight.style.padding='12px';
+    // Memory table
+    const mem = item.memory || {}; const memRows = [];
+    if(mem.total || mem.used || mem.free || mem.available){ memRows.push(['Total', h(mem.total)], ['Used', h(mem.used)], ['Free', h(mem.free)], ['Available', h(mem.available)]); }
+    if(mem.swap_total || mem.swap_used){ memRows.push(['Swap Total', h(mem.swap_total)], ['Swap Used', h(mem.swap_used)]); }
+    perfRight.appendChild(document.createElement('h3')).textContent = 'Memory';
+    perfRight.appendChild(mkTable(['Metric','Value'], memRows));
+    perfGrid.appendChild(perfLeft); perfGrid.appendChild(perfRight); sec.appendChild(perfGrid);
+    frag.appendChild(sec);
+
+    // Disks
+    sec = section('Disk Usage');
+    const diskRows = (item.disks||[]).map(d => [h(d.device), h(d.fs_type), h(d.size), h(d.used), h(d.avail), h(d.used_percent), h(d.mountpoint)]);
+    sec.appendChild(mkTable(['Device','FS','Size','Used','Avail','Used%','Mount'], diskRows));
+    frag.appendChild(sec);
+
+    // Processes
+    sec = section('Top Processes');
+    const procGrid = document.createElement('div'); procGrid.className = 'grid';
+    const pm = document.createElement('div'); pm.className='card'; pm.style.padding='12px';
+    pm.appendChild(document.createElement('h3')).textContent='Top Memory';
+    pm.appendChild(mkTable(['PID','PPID','Name','CPU%','MEM%','CMD'], (item.processes && item.processes.top_mem || []).map(p => [h(p.pid),h(p.ppid),h(p.process_name),h(p.cpu_usage),h(p.mem_usage),h(p.cmd)])));
+    const pc = document.createElement('div'); pc.className='card'; pc.style.padding='12px';
+    pc.appendChild(document.createElement('h3')).textContent='Top CPU';
+    pc.appendChild(mkTable(['PID','PPID','Name','CPU%','MEM%','CMD'], (item.processes && item.processes.top_cpu || []).map(p => [h(p.pid),h(p.ppid),h(p.process_name),h(p.cpu_usage),h(p.mem_usage),h(p.cmd)])));
+    procGrid.appendChild(pm); procGrid.appendChild(pc); sec.appendChild(procGrid);
+    frag.appendChild(sec);
+
+    // Network
+    sec = section('Network');
+    const netGrid = document.createElement('div'); netGrid.className='grid';
+    const ni = document.createElement('div'); ni.className='card'; ni.style.padding='12px';
+    ni.appendChild(document.createElement('h3')).textContent='Interfaces';
+    ni.appendChild(mkTable(['Name','State','IPv4','IPv6'], (item.net||[]).map(n => [h(n.name),h(n.state),h(n.ipv4),h(n.ipv6)])));
+    const lp = document.createElement('div'); lp.className='card'; lp.style.padding='12px';
+    lp.appendChild(document.createElement('h3')).textContent='Listening Ports';
+    lp.appendChild(mkTable(['Proto','Address','Port'], (item.listen||[]).map(l => [h(l.proto),h(l.local_addr),h(l.local_port)])));
+    netGrid.appendChild(ni); netGrid.appendChild(lp); sec.appendChild(netGrid);
+    frag.appendChild(sec);
+
+    // Users & Services
+    sec = section('Users & Services');
+    const usGrid = document.createElement('div'); usGrid.className='grid';
+    const users = document.createElement('div'); users.className='card'; users.style.padding='12px';
+    users.appendChild(document.createElement('h3')).textContent='Logged-in Users';
+    users.appendChild(mkTable(['User','TTY','Login At','From'], (item.users||[]).map(u => [h(u.user),h(u.tty),h(u.login_at),h(u.from_host)])));
+    const svc = document.createElement('div'); svc.className='card'; svc.style.padding='12px';
+    svc.appendChild(document.createElement('h3')).textContent='Running Services';
+    svc.appendChild(mkTable(['Name','Load','Active','Sub','Description'], (item.services||[]).map(s => [h(s.name),h(s.load_state),h(s.active_state),h(s.sub_state),h(s.description)])));
+    usGrid.appendChild(users); usGrid.appendChild(svc); sec.appendChild(usGrid);
+    frag.appendChild(sec);
+
+    // Logs & Mounts
+    sec = section('Logs & Filesystems');
+    const lmGrid = document.createElement('div'); lmGrid.className='grid';
+    const logs = document.createElement('div'); logs.className='card'; logs.style.padding='12px';
+    logs.appendChild(document.createElement('h3')).textContent='Recent Logs';
+    const pre1 = document.createElement('pre'); pre1.className='mono'; pre1.textContent = (item.logs||[]).join("\n"); logs.appendChild(pre1);
+    const mnt = document.createElement('div'); mnt.className='card'; mnt.style.padding='12px';
+    mnt.appendChild(document.createElement('h3')).textContent='Mounted Filesystems';
+    mnt.appendChild(mkTable(['Spec','Mount','FStype','Options'], (item.mounts||[]).map(m => [h(m.spec),h(m.mountpoint),h(m.fstype),h(m.options)])));
+    lmGrid.appendChild(logs); lmGrid.appendChild(mnt); sec.appendChild(lmGrid);
+    frag.appendChild(sec);
+
+    return frag;
+  }
+
+  async function load(){
+    const host = document.getElementById('hostInput').value.trim();
+    const limit = Math.max(1, Math.min(20, parseInt(document.getElementById('limitInput').value||'1',10)));
+    const qs = `?${host?`hostname=${encodeURIComponent(host)}&`:''}limit=${encodeURIComponent(limit)}`;
+    elStatus.textContent = 'Loading...';
+    try{
+      const res = await fetch('/api/linux-data'+qs, {credentials:'same-origin'});
+      if(!res.ok){ elStatus.textContent = 'Failed to load'; return; }
+      const data = await res.json();
+      const items = data.items || [];
+      elStatus.textContent = `Loaded ${items.length} record(s)`;
+      elRes.innerHTML = '';
+      items.forEach(it => { elRes.appendChild(renderItem(it)); });
+    }catch(e){ elStatus.textContent = 'Error'; }
+  }
+
+  document.getElementById('loadBtn').addEventListener('click', load);
+  load();
+})();
+</script>
+</body>
+</html>

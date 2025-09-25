@@ -73,11 +73,12 @@
         <canvas id="cmChart" width="800" height="400" style="width:800px;height:400px;display:block;"></canvas>
       </div>
     </div>
+
   </div>
 
 <script>
 (function(){
-  const serverId = {{ server.id }};
+  const serverId = {{ server.id | tojson }};
   const cmCtx = document.getElementById('cmChart').getContext('2d');
   const noteEl = document.getElementById('series-note');
 

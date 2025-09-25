@@ -172,6 +172,126 @@ def ensure_server_status_windows_schema():
 
 ensure_server_status_windows_schema()
 
+# ---------- Normalized Linux Collection Schema ----------
+def ensure_linux_collect_schema():
+    conn = get_db_connection(); c = conn.cursor()
+    c.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS system_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hostname TEXT,
+            date_time TEXT,
+            kernel_version TEXT,
+            architecture TEXT,
+            os_info TEXT,
+            uptime TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_system_info_host_dt ON system_info(hostname, date_time);
+
+        CREATE TABLE IF NOT EXISTS cpu_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            cpu_model TEXT,
+            cores INTEGER,
+            threads INTEGER,
+            cpu_speed_mhz REAL,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            total TEXT, used TEXT, free TEXT, available TEXT,
+            swap_total TEXT, swap_used TEXT,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS disk_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            device TEXT, fs_type TEXT, size TEXT, used TEXT, avail TEXT, used_percent TEXT, mountpoint TEXT,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS process_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            pid INTEGER, ppid INTEGER, process_name TEXT, cmd TEXT, cpu_usage REAL, mem_usage REAL,
+            kind TEXT,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS net_interface (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            name TEXT, state TEXT, ipv4 TEXT, ipv6 TEXT,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS listen_port (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            proto TEXT, local_addr TEXT, local_port TEXT,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS logged_in_user (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            user TEXT, tty TEXT, login_at TEXT, from_host TEXT,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS system_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            line TEXT,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS mount_fs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            spec TEXT, mountpoint TEXT, fstype TEXT, options TEXT,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS service (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            system_info_id INTEGER NOT NULL,
+            name TEXT, load_state TEXT, active_state TEXT, sub_state TEXT, description TEXT,
+            FOREIGN KEY(system_info_id) REFERENCES system_info(id) ON DELETE CASCADE
+        );
+        """
+    )
+    conn.commit(); conn.close()
+
+ensure_linux_collect_schema()
+
+# ---------- Linux System Info Schema ----------
+def ensure_linux_system_info_schema():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS linux_system_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            collected_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            FOREIGN KEY(server_id) REFERENCES servers(id)
+        )
+        """
+    )
+    try:
+        c.execute("CREATE INDEX IF NOT EXISTS ix_linux_sysinfo_server_ts ON linux_system_info(server_id, collected_at)")
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+
+ensure_linux_system_info_schema()
+
 # ---------- Server Alerts Schema ----------
 def ensure_server_alerts_schema():
     conn = get_db_connection()
@@ -1748,6 +1868,168 @@ def api_server_status_latest():
     conn.close()
     return jsonify({"server_status": rows})
 
+# ---------- Normalized Linux Collection APIs ----------
+@app.route('/api/linux-collect', methods=['POST'])
+def api_linux_collect():
+    """Collect normalized Linux system info. Expects structured JSON.
+    Example top-level keys: hostname,date_time,kernel_version,architecture,os_info,uptime,
+    cpu:{cpu_model,cores,threads,cpu_speed_mhz},
+    memory:{total,used,free,available,swap_total,swap_used},
+    disks:[{device,fs_type,size,used,avail,used_percent,mountpoint}],
+    processes:{top_mem:[...], top_cpu:[...]},
+    net:[{name,state,ipv4,ipv6}],
+    listen:[{proto,local_addr,local_port}],
+    users:[{user,tty,login_at,from_host}],
+    logs:["line"...], mounts:[{spec,mountpoint,fstype,options}],
+    services:[{name,load_state,active_state,sub_state,description}]
+    """
+    try:
+        body = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "invalid json"}), 400
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid payload"}), 400
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        # Insert system_info
+        sys_fields = (
+            body.get('hostname'), body.get('date_time'), body.get('kernel_version'),
+            body.get('architecture'), body.get('os_info'), body.get('uptime')
+        )
+        c.execute("INSERT INTO system_info(hostname,date_time,kernel_version,architecture,os_info,uptime) VALUES(?,?,?,?,?,?)", sys_fields)
+        sys_id = c.lastrowid
+
+        # CPU
+        cpu = body.get('cpu') or {}
+        c.execute(
+            "INSERT INTO cpu_info(system_info_id,cpu_model,cores,threads,cpu_speed_mhz) VALUES(?,?,?,?,?)",
+            (sys_id, cpu.get('cpu_model'), cpu.get('cores'), cpu.get('threads'), cpu.get('cpu_speed_mhz'))
+        )
+
+        # Memory
+        mem = body.get('memory') or {}
+        c.execute(
+            "INSERT INTO memory_usage(system_info_id,total,used,free,available,swap_total,swap_used) VALUES(?,?,?,?,?,?,?)",
+            (sys_id, mem.get('total'), mem.get('used'), mem.get('free'), mem.get('available'), mem.get('swap_total'), mem.get('swap_used'))
+        )
+
+        # Disks
+        for d in body.get('disks') or []:
+            c.execute(
+                "INSERT INTO disk_usage(system_info_id,device,fs_type,size,used,avail,used_percent,mountpoint) VALUES(?,?,?,?,?,?,?,?)",
+                (sys_id, d.get('device'), d.get('fs_type'), d.get('size'), d.get('used'), d.get('avail'), d.get('used_percent'), d.get('mountpoint'))
+            )
+
+        # Processes
+        for kind, arr in (body.get('processes') or {}).items():
+            for p in arr or []:
+                c.execute(
+                    "INSERT INTO process_info(system_info_id,pid,ppid,process_name,cmd,cpu_usage,mem_usage,kind) VALUES(?,?,?,?,?,?,?,?)",
+                    (sys_id, p.get('pid'), p.get('ppid'), p.get('process_name'), p.get('cmd'), p.get('cpu_usage'), p.get('mem_usage'), kind)
+                )
+
+        # Network interfaces
+        for n in body.get('net') or []:
+            c.execute(
+                "INSERT INTO net_interface(system_info_id,name,state,ipv4,ipv6) VALUES(?,?,?,?,?)",
+                (sys_id, n.get('name'), n.get('state'), n.get('ipv4'), n.get('ipv6'))
+            )
+
+        # Listening ports
+        for lp in body.get('listen') or []:
+            c.execute(
+                "INSERT INTO listen_port(system_info_id,proto,local_addr,local_port) VALUES(?,?,?,?)",
+                (sys_id, lp.get('proto'), lp.get('local_addr'), lp.get('local_port'))
+            )
+
+        # Users
+        for u in body.get('users') or []:
+            c.execute(
+                "INSERT INTO logged_in_user(system_info_id,user,tty,login_at,from_host) VALUES(?,?,?,?,?)",
+                (sys_id, u.get('user'), u.get('tty'), u.get('login_at'), u.get('from_host'))
+            )
+
+        # Logs
+        for line in body.get('logs') or []:
+            c.execute("INSERT INTO system_log(system_info_id,line) VALUES(?,?)", (sys_id, line))
+
+        # Mounts
+        for m in body.get('mounts') or []:
+            c.execute(
+                "INSERT INTO mount_fs(system_info_id,spec,mountpoint,fstype,options) VALUES(?,?,?,?,?)",
+                (sys_id, m.get('spec'), m.get('mountpoint'), m.get('fstype'), m.get('options'))
+            )
+
+        # Services
+        for s in body.get('services') or []:
+            c.execute(
+                "INSERT INTO service(system_info_id,name,load_state,active_state,sub_state,description) VALUES(?,?,?,?,?,?)",
+                (sys_id, s.get('name'), s.get('load_state'), s.get('active_state'), s.get('sub_state'), s.get('description'))
+            )
+
+        conn.commit()
+        return jsonify({"ok": True, "system_info_id": sys_id}), 201
+    except Exception as e:
+        conn.rollback(); return jsonify({"error": f"db_error: {e}"}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/linux-data')
+def api_linux_data():
+    """Return the latest structured record for a hostname (or all, limited).
+    Query: hostname (optional), limit (default 1)
+    """
+    hostname = request.args.get('hostname')
+    limit = max(1, min(20, request.args.get('limit', type=int) or 1))
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        if hostname:
+            c.execute("SELECT * FROM system_info WHERE hostname=? ORDER BY date_time DESC LIMIT ?", (hostname, limit))
+        else:
+            c.execute("SELECT * FROM system_info ORDER BY date_time DESC LIMIT ?", (limit,))
+        sys_rows = [dict(r) for r in c.fetchall()]
+        out = []
+        for srow in sys_rows:
+            sid = srow['id']
+            # one-to-one
+            c.execute("SELECT cpu_model,cores,threads,cpu_speed_mhz FROM cpu_info WHERE system_info_id=?", (sid,)); cpu = c.fetchone()
+            srow['cpu'] = dict(cpu) if cpu else None
+            c.execute("SELECT total,used,free,available,swap_total,swap_used FROM memory_usage WHERE system_info_id=?", (sid,)); mem = c.fetchone()
+            srow['memory'] = dict(mem) if mem else None
+            # one-to-many collections
+            def rows(sql):
+                c.execute(sql, (sid,)); return [dict(r) for r in c.fetchall()]
+            srow['disks'] = rows("SELECT device,fs_type,size,used,avail,used_percent,mountpoint FROM disk_usage WHERE system_info_id=?")
+            srow['processes'] = {
+                'top_mem': rows("SELECT pid,ppid,process_name,cmd,cpu_usage,mem_usage FROM process_info WHERE system_info_id=? AND kind='top_mem'"),
+                'top_cpu': rows("SELECT pid,ppid,process_name,cmd,cpu_usage,mem_usage FROM process_info WHERE system_info_id=? AND kind='top_cpu'")
+            }
+            srow['net'] = rows("SELECT name,state,ipv4,ipv6 FROM net_interface WHERE system_info_id=?")
+            srow['listen'] = rows("SELECT proto,local_addr,local_port FROM listen_port WHERE system_info_id=?")
+            srow['users'] = rows("SELECT user,tty,login_at,from_host FROM logged_in_user WHERE system_info_id=?")
+            srow['logs'] = [r['line'] for r in rows("SELECT line FROM system_log WHERE system_info_id=?")] if True else []
+            srow['mounts'] = rows("SELECT spec,mountpoint,fstype,options FROM mount_fs WHERE system_info_id=?")
+            srow['services'] = rows("SELECT name,load_state,active_state,sub_state,description FROM service WHERE system_info_id=?")
+            out.append(srow)
+        return jsonify({"items": out})
+    finally:
+        conn.close()
+
+@app.route('/linux')
+def linux_viewer():
+    return render_template('linux_viewer.html')
+
+
+# ---------- Linux System Info APIs ----------
+@app.route('/api/linux-system-info', methods=['POST'])
+def api_linux_system_info_ingest():
+    return jsonify({"error": "linux_system_info_disabled"}), 410
+
+@app.route('/api/linux-system-info/latest')
+@login_required
+def api_linux_system_info_latest():
+    return jsonify({"error": "linux_system_info_disabled"}), 410
+
 # Time-series APIs for charts
 @app.route('/api/server-status/history')
 @login_required
@@ -1911,6 +2193,12 @@ def server_detail(server_id):
     info = {"id": row[0], "name": row[1], "ip_address": row[2], "location": row[3], "alive": bool(row[4]), "last_ping_at": row[5]}
     conn.close()
     return render_template('server_detail.html', server=info, user=user)
+
+@app.route('/server/<int:server_id>/linux-info')
+@login_required
+def server_linux_info(server_id: int):
+    flash("Linux system info feature is disabled.", "warning")
+    return redirect(url_for('server'))
 
 @app.route('/api/server-status/latest-windows')
 @login_required

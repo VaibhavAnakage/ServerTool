@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Linux Info - {{ server.name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:16px; }
+    .card-sec { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:12px; box-shadow:0 1px 2px rgba(0,0,0,0.04); }
+    .mono { white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px; line-height:1.4; }
+    .kv { margin:0; padding:0; list-style:none; }
+    .kv li { margin:4px 0; }
+    .badge { font-size:12px; padding:2px 6px; border-radius:6px; }
+    .badge-pill { border-radius:999px; }
+    .badge-muted { background:#eef2ff; color:#3730a3; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>Linux Info - {{ server.name }}</h1>
+    </div>
+  </header>
+
+  <nav>
+    <div class="container">
+      <ul>
+        <li><a href="/">Dashboard</a></li>
+        <li><a href="/server">Server Info</a></li>
+        <li><a href="/server/{{ server.id }}">Server Detail</a></li>
+        <li style="margin-left:auto"><a href="/logout">Logout ({{ user.name if user else '' }})</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h2>Overview</h2>
+      <ul class="kv">
+        <li><strong>Server:</strong> {{ server.name }} (ID {{ server.id }})</li>
+        <li><strong>IP:</strong> {{ server.ip }}</li>
+        <li><strong>Location:</strong> {{ server.location or '-' }}</li>
+        <li><strong>Collected At:</strong> {{ collected_at or '-' }}</li>
+      </ul>
+    </div>
+
+    <div class="grid">
+      <div class="card-sec">
+        <h3>System</h3>
+        <ul class="kv">
+          <li><strong>Date/Time:</strong> {{ data.get('date_time','-') }}</li>
+          <li><strong>Hostname:</strong> {{ data.get('hostname','-') }}</li>
+          <li><strong>Kernel:</strong> {{ data.get('kernel_version','-') }}</li>
+          <li><strong>Arch:</strong> {{ data.get('architecture','-') }}</li>
+          <li><strong>Uptime:</strong> {{ data.get('uptime','-') }}</li>
+        </ul>
+        <div class="mono" style="margin-top:8px;">
+          <strong>OS Info</strong>\n{{ data.get('os_info','-') }}
+        </div>
+      </div>
+
+      <div class="card-sec">
+        <h3>CPU</h3>
+        <div class="mono">{{ data.get('cpu_info','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Memory</h3>
+        <div class="mono">{{ data.get('memory_usage','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Disk</h3>
+        <div class="mono">{{ data.get('disk_usage','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Top Memory Processes</h3>
+        <div class="mono">{{ data.get('top_memory_processes','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Top CPU Processes</h3>
+        <div class="mono">{{ data.get('top_cpu_processes','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Network Interfaces</h3>
+        <div class="mono">{{ data.get('network_interfaces','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Listening Ports</h3>
+        <div class="mono">{{ data.get('listening_ports','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Logged In Users</h3>
+        <div class="mono">{{ data.get('logged_in_users','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Recent System Logs</h3>
+        <div class="mono">{{ data.get('system_logs','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Mounted Filesystems</h3>
+        <div class="mono">{{ data.get('mounted_filesystems','-') }}</div>
+      </div>
+
+      <div class="card-sec">
+        <h3>Running Services</h3>
+        <div class="mono">{{ data.get('running_services','-') }}</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
