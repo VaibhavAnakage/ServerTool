@@ -20,6 +20,9 @@
                 <li><a href="/server">Server Info</a></li>
                 <li><a href="/server/history">Server History</a></li>
                 <li><a href="/run_alerts">Run Alerts</a></li>
+                {% if user and (user.role or '').lower() == 'super_admin' %}
+                    <li><a href="/users">Users</a></li>
+                {% endif %}
                 {% if user %}
                     <li style="margin-left:auto"><a href="/logout">Logout ({{ user.name }})</a></li>
                 {% else %}
@@ -160,7 +163,7 @@
                                 <a href="/server/ping/{{ s.id }}" class="btn btn-sm btn-secondary">Ping</a>
                                 <a href="/server/edit/{{ s.id }}" class="btn btn-sm btn-primary" style="margin-left:6px;">Edit</a>
                                 <button type="button" class="btn btn-sm btn-info btn-alert-emails" style="margin-left:6px;" data-server-id="{{ s.id }}" data-server-name='{{ s.name|tojson }}'>Alert Emails</button>
-                                <form action="/server/delete/{{ s.id }}" method="POST" style="display:inline-block; margin-left:6px;" onsubmit="return confirm('Delete server \' + ({{ s.name|tojson }}) + '\'?');">
+                                <form action="/server/delete/{{ s.id }}" method="POST" style="display:inline-block; margin-left:6px;" onsubmit='return confirm("Delete server {{ s.name|e }}?");'>
                                     <button type="submit" class="btn btn-sm btn-danger">Delete</button>
                                 </form>
                             </td>
@@ -171,7 +174,7 @@
         </div>
 
         <div class="card">
-            <h2>Server Status</h2>
+            <h2>Server Status (Linux)</h2>
             <div class="table-container">
                 <table id="server-status-table">
                     <thead>
@@ -182,6 +185,28 @@
                             <th>Total Disk (GB)</th>
                             <th>Used Disk (GB)</th>
                             <th>Disk %</th>
+                            <th>Last Updated</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Server Status (Windows)</h2>
+            <div class="table-container">
+                <table id="server-status-windows-table">
+                    <thead>
+                        <tr>
+                            <th>Server</th>
+                            <th>CPU Usage</th>
+                            <th>Memory Usage</th>
+                            <th>Total Drives</th>
+                            <th>C: Total (GB)</th>
+                            <th>C: Used (GB)</th>
+                            <th>C: %</th>
                             <th>Last Updated</th>
                         </tr>
                     </thead>
@@ -286,6 +311,43 @@
     }
     setInterval(refreshServerStatus, 12000);
     refreshServerStatus();
+
+    // Auto-refresh latest Windows server metrics every 12 seconds
+    async function refreshServerStatusWindows() {
+        try {
+            const res = await fetch('/api/server-status/latest-windows', { credentials: 'same-origin' });
+            if (!res.ok) return;
+            const data = await res.json();
+            const tbody = document.querySelector('#server-status-windows-table tbody');
+            if (!tbody) return;
+            const rows = (data.server_status || []).map(item => {
+                const cpu = item.cpu_usage == null ? '-' : (item.cpu_usage.toFixed ? item.cpu_usage.toFixed(1) : item.cpu_usage) + '%';
+                const mem = item.memory_usage == null ? '-' : (item.memory_usage.toFixed ? item.memory_usage.toFixed(1) : item.memory_usage) + '%';
+                const drives = item.total_drives == null ? '-' : item.total_drives;
+                const ctot = item.c_total_gb == null ? '-' : item.c_total_gb;
+                const cused = item.c_used_gb == null ? '-' : item.c_used_gb;
+                const cpct = item.c_percent == null ? '-' : (item.c_percent.toFixed ? item.c_percent.toFixed(1) : item.c_percent) + '%';
+                const name = item.name || ('#' + item.server_id);
+                return `
+                    <tr>
+                        <td>${name}</td>
+                        <td>${cpu}</td>
+                        <td>${mem}</td>
+                        <td>${drives}</td>
+                        <td>${ctot}</td>
+                        <td>${cused}</td>
+                        <td>${cpct}</td>
+                        <td>${item.last_updated || '-'}</td>
+                    </tr>
+                `;
+            }).join('');
+            tbody.innerHTML = rows;
+        } catch (e) {
+            // ignore transient errors
+        }
+    }
+    setInterval(refreshServerStatusWindows, 12000);
+    refreshServerStatusWindows();
 
     // ===== Alert Emails Modal =====
     function openAlertEmails(serverId, serverName){

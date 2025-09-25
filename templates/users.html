@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Users Management</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+<header>
+    <div class="container">
+        <h1>Users Management</h1>
+    </div>
+</header>
+<nav>
+    <div class="container">
+        <ul>
+            <li><a href="/">Dashboard</a></li>
+            <li><a href="/domain">Domain Monitoring</a></li>
+            <li><a href="/server">Server Info</a></li>
+            <li><a href="/server/history">Server History</a></li>
+            <li><a href="/run_alerts">Run Alerts</a></li>
+            {% if user and (user.role or '').lower() == 'super_admin' %}
+                <li><a href="/users">Users</a></li>
+            {% endif %}
+            {% if user %}
+                <li style="margin-left:auto"><a href="/logout">Logout ({{ user.name }})</a></li>
+            {% else %}
+                <li style="margin-left:auto"><a href="/login">Login</a></li>
+            {% endif %}
+        </ul>
+    </div>
+</nav>
+<div class="container">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }}">
+            <strong>{{ category.title() }}:</strong> {{ message }}
+          </div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <div class="card">
+        <div class="d-flex justify-content-between align-items-center">
+            <h2>All Users</h2>
+            <div>
+              <a class="btn btn-secondary" href="/users/create?role=api" title="Create API ingestion-only user">Add API User</a>
+              <a class="btn btn-primary" href="/users/create">Add User</a>
+            </div>
+        </div>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Email</th>
+                        <th>Role</th>
+                        <th>Location</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for u in users %}
+                    <tr>
+                        <td>{{ u.name }}</td>
+                        <td>{{ u.email }}</td>
+                        <td>
+                          {{ u.role }}
+                          {% if (u.role or '').lower() == 'api' %}
+                            <span class="badge badge-info" title="Cannot login to portal; for API Basic Auth only">ingestion-only</span>
+                          {% endif %}
+                        </td>
+                        <td>{{ u.location or '-' }}</td>
+                        <td>
+                            <a class="btn btn-sm btn-primary" href="/users/edit/{{ u.id }}">Edit</a>
+                            <form action="/users/delete/{{ u.id }}" method="POST" style="display:inline-block; margin-left:6px;" onsubmit="return confirm('Delete user {{ u.email|e }}?');">
+                                <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+</body>
+</html>

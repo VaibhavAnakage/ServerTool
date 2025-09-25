@@ -1,10 +1,20 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
-import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback, threading, time
+import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback, threading, time, collections
 from email.message import EmailMessage
 
 app = Flask(__name__)
 app.secret_key = "replace-with-your-secret"  # for flash messages
-DB_FILE = "monitoring.db"
+DB_FILE = os.environ.get('MONITORING_DB_PATH', 'monitoring.db')
+ACTIVE_PING_ENABLED = os.environ.get('ACTIVE_PING_ENABLED', '0') == '1'
+GLOBAL_INGEST_LOCK = threading.Lock()
+INGEST_QUEUE = collections.deque(maxlen=10000)
+INGEST_EVENT = threading.Event()
+INGEST_STATS = {
+    'enqueued': 0,
+    'processed': 0,
+    'errors': 0,
+    'last_error': None,
+}
 
 # ---------------- SMTP CONFIG ----------------
 # Replace with your SMTP details
@@ -20,8 +30,14 @@ SMTP_CONFIG = {
 
 # ---------- DB Helper ----------
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    # Increase timeout to wait for locks; allow cross-thread usage; row_factory for dict-like rows
+    conn = sqlite3.connect(DB_FILE, timeout=15, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    try:
+        # Busy timeout at the connection level as well (ms)
+        conn.execute("PRAGMA busy_timeout = 15000")
+    except Exception:
+        pass
     return conn
 
 # Cross-platform ping helper
@@ -40,6 +56,37 @@ def ping_host(target: str, timeout_seconds: int = 3) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+# ---------- Ping Logs Helpers ----------
+LOGS_DIR = os.path.join(os.path.dirname(__file__), 'logs', 'txtx')
+PING_LOG_FILE = os.path.join(LOGS_DIR, 'ping_logs.txt')
+
+def ensure_ping_logs_dir():
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        # ensure the file exists
+        if not os.path.exists(PING_LOG_FILE):
+            with open(PING_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write('')
+    except Exception:
+        pass
+
+def write_ping_log(ip: str, alive: bool, source: str, server_id=None, name=None):
+    """Append a single ping event to the ping logs file.
+    Format: ISO_TIME | SOURCE | SERVER_ID | NAME | IP | STATUS
+    """
+    try:
+        ensure_ping_logs_dir()
+        ts = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+        status = 'ONLINE' if alive else 'OFFLINE'
+        sid = str(server_id) if server_id is not None else '-'
+        sname = name or '-'
+        line = f"{ts} | {source} | {sid} | {sname} | {ip} | {status}\n"
+        with open(PING_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(line)
+    except Exception:
+        # swallow logging errors to not affect app flow
+        pass
 
 # ---------- DB Migration Helpers ----------
 def ensure_alerts_schema():
@@ -86,10 +133,44 @@ def ensure_server_status_schema():
         )
         """
     )
+    # Ensure unique index to prevent duplicate inserts for the same timestamp per server
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_server_status_server_ts ON server_status(server_id, last_updated)")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
 ensure_server_status_schema()
+
+# Windows-specific server status schema
+def ensure_server_status_windows_schema():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS server_status_windows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            cpu_usage REAL,
+            memory_usage REAL,
+            total_drives INTEGER,
+            c_total_gb REAL,
+            c_used_gb REAL,
+            c_percent REAL,
+            last_updated TEXT,
+            FOREIGN KEY(server_id) REFERENCES servers(id)
+        )
+        """
+    )
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_server_status_win_server_ts ON server_status_windows(server_id, last_updated)")
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+
+ensure_server_status_windows_schema()
 
 # ---------- Server Alerts Schema ----------
 def ensure_server_alerts_schema():
@@ -112,6 +193,148 @@ def ensure_server_alerts_schema():
 
 ensure_server_alerts_schema()
 
+# Extra indices to speed up lookups and latest queries
+def ensure_performance_indices():
+    try:
+        conn = get_db_connection(); c = conn.cursor()
+        # For resolving servers quickly by (name, ip_address)
+        c.execute("CREATE INDEX IF NOT EXISTS ix_servers_name_ip ON servers(name, ip_address)")
+        # For latest status queries by server
+        c.execute("CREATE INDEX IF NOT EXISTS ix_server_status_server ON server_status(server_id)")
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+
+ensure_performance_indices()
+
+# Apply global PRAGMAs (WAL, synchronous normal) once
+def ensure_sqlite_pragmas():
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        # WAL mode allows one writer with many readers and reduces lock contention
+        c.execute("PRAGMA journal_mode = WAL")
+        # Reasonable durability with better concurrency
+        c.execute("PRAGMA synchronous = NORMAL")
+        # Connection-level busy timeout already set, but set database default too
+        c.execute("PRAGMA busy_timeout = 15000")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+ensure_sqlite_pragmas()
+
+# ---------- Ingestion Worker ----------
+def _ingest_write_once(task):
+    """Write a single metrics task to DB with minimal locking. Supports linux/windows kinds."""
+    server_id = task['server_id']
+    ts = task['ts']
+    kind = task.get('kind', 'linux')
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        with GLOBAL_INGEST_LOCK:
+            if kind == 'windows':
+                c.execute(
+                    """
+                    INSERT OR IGNORE INTO server_status_windows (server_id, cpu_usage, memory_usage, total_drives, c_total_gb, c_used_gb, c_percent, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        server_id,
+                        task.get('cpu_usage'),
+                        task.get('memory_usage'),
+                        task.get('total_drives'),
+                        task.get('c_total_gb'),
+                        task.get('c_used_gb'),
+                        task.get('c_percent'),
+                        ts,
+                    )
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT OR IGNORE INTO server_status (server_id, cpu_usage, memory_usage, total_disk, used_disk, disk_percent, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        server_id,
+                        task.get('cpu_usage'),
+                        task.get('memory_usage'),
+                        task.get('total_disk'),
+                        task.get('used_disk'),
+                        task.get('disk_percent'),
+                        ts,
+                    )
+                )
+            c.execute("UPDATE servers SET alive=1, last_ping_at=? WHERE id=?", (ts, server_id))
+            conn.commit()
+    finally:
+        conn.close()
+    # Log successful write for visibility
+    try:
+        print(f"[ingest] wrote kind={kind} server_id={server_id} ts={ts}")
+        INGEST_STATS['processed'] += 1
+    except Exception:
+        pass
+
+def ingest_worker():
+    """Background worker to serialize DB writes from the ingestion endpoint."""
+    while True:
+        # Wait until there is work
+        INGEST_EVENT.wait(timeout=1.0)
+        try:
+            while True:
+                try:
+                    task = INGEST_QUEUE.popleft()
+                except IndexError:
+                    # No more tasks; clear event and break
+                    INGEST_EVENT.clear()
+                    break
+                # Retry a few times on locked
+                attempts = 0
+                backoff = 0.05
+                while True:
+                    attempts += 1
+                    try:
+                        _ingest_write_once(task)
+                        break
+                    except sqlite3.OperationalError as e:
+                        if 'locked' in str(e).lower() or 'busy' in str(e).lower():
+                            time.sleep(min(0.5, backoff * attempts))
+                            continue
+                        else:
+                            # Drop this task but do not crash worker
+                            try:
+                                INGEST_STATS['errors'] += 1
+                                INGEST_STATS['last_error'] = f"OperationalError: {e}"
+                                print(f"[ingest] error: {e}")
+                            except Exception:
+                                pass
+                            break
+                    except Exception as e:
+                        # Catch-all to avoid worker death
+                        try:
+                            INGEST_STATS['errors'] += 1
+                            INGEST_STATS['last_error'] = f"{type(e).__name__}: {e}"
+                            print(f"[ingest] unexpected error: {type(e).__name__}: {e}")
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            # Never let the worker die
+            time.sleep(0.1)
+
+# Start worker thread (daemon) only in the active reloader process
+try:
+    # When using Flask debug reloader, this env var is 'true' in the child process that serves requests
+    if os.environ.get('WERKZEUG_RUN_MAIN', 'true').lower() == 'true':
+        _t = threading.Thread(target=ingest_worker, name='ingest-worker', daemon=True)
+        _t.start()
+        print('[ingest] worker started')
+except Exception as _e:
+    print(f'[ingest] worker failed to start: {_e}')
+
 # ---------- Auth & RBAC Helpers ----------
 def get_current_user():
     user_id = session.get('user_id')
@@ -129,6 +352,18 @@ def login_required(view_func):
     def wrapper(*args, **kwargs):
         if not get_current_user():
             return redirect(url_for('login', next=request.path))
+        return view_func(*args, **kwargs)
+    return wrapper
+
+def super_admin_required(view_func):
+    @functools.wraps(view_func)
+    def wrapper(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return redirect(url_for('login'))
+        if (user["role"] or "").lower() != "super_admin":
+            flash("Only super admin can access this page.", "danger")
+            return redirect(url_for('index'))
         return view_func(*args, **kwargs)
     return wrapper
 
@@ -166,6 +401,59 @@ def rbac_write_required(view_func):
         return view_func(*args, **kwargs)
     return wrapper
 
+# ---------- API Basic Auth Helpers ----------
+def require_basic_auth_api():
+    """Validate HTTP Basic Auth against users table for role='api'.
+    Returns (ok, result). If ok is True, result is the user row; otherwise, result is a Flask response (401).
+    """
+    auth = request.authorization
+    if not auth or not auth.username or not auth.password:
+        resp = jsonify({"error": "authentication required"})
+        resp.status_code = 401
+        resp.headers['WWW-Authenticate'] = 'Basic realm="Metrics API"'
+        return False, resp
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, email, password_hash, role FROM users WHERE email = ? AND LOWER(role)='api'", (auth.username.strip().lower(),))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        resp = jsonify({"error": "invalid credentials"})
+        resp.status_code = 401
+        resp.headers['WWW-Authenticate'] = 'Basic realm="Metrics API"'
+        return False, resp
+    from werkzeug.security import check_password_hash
+    if not check_password_hash(row["password_hash"], auth.password):
+        resp = jsonify({"error": "invalid credentials"})
+        resp.status_code = 401
+        resp.headers['WWW-Authenticate'] = 'Basic realm="Metrics API"'
+        return False, resp
+    return True, row
+
+def ensure_api_user_seed():
+    """Optionally seed an API user from env vars.
+    Set API_INGEST_EMAIL and API_INGEST_PASSWORD to auto-create/update the API user.
+    """
+    email = (os.environ.get('API_INGEST_EMAIL') or '').strip().lower()
+    password = os.environ.get('API_INGEST_PASSWORD')
+    if not email or not password:
+        return
+    try:
+        from werkzeug.security import generate_password_hash
+        pw_hash = generate_password_hash(password)
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT id FROM users WHERE email=?", (email,))
+        existing = c.fetchone()
+        if existing:
+            c.execute("UPDATE users SET password_hash=?, role='api', location=NULL, name=COALESCE(name,'API User') WHERE email=?", (pw_hash, email))
+        else:
+            c.execute("INSERT INTO users(name, email, password_hash, role, location) VALUES(?, ?, ?, 'api', NULL)", ("API User", email, pw_hash))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
 # ---------- Auth Routes ----------
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -175,11 +463,15 @@ def login():
     password = request.form.get('password', '')
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT id, email, password_hash FROM users WHERE email = ?", (email,))
+    c.execute("SELECT id, email, password_hash, role FROM users WHERE email = ?", (email,))
     row = c.fetchone()
     conn.close()
     from werkzeug.security import check_password_hash
     if row and check_password_hash(row["password_hash"], password):
+        # Disallow API user from portal login
+        if (row["role"] or '').lower() == 'api':
+            flash("API user cannot log into the portal.", "danger")
+            return redirect(url_for('login'))
         session['user_id'] = row["id"]
         flash("Logged in successfully.", "success")
         return redirect(request.args.get('next') or url_for('index'))
@@ -830,7 +1122,7 @@ def edit_server(server_id):
     else:
         server_info = None
 
-    # Load and ping servers
+    # Load and conditionally ping servers (throttled)
     conn = get_db_connection()
     c = conn.cursor()
     base_sql = "SELECT id, name, ip_address, location, alive, last_ping_at FROM servers"
@@ -842,19 +1134,42 @@ def edit_server(server_id):
     c.execute(base_sql, params)
     servers = c.fetchall()
 
+    # Throttle to once per 60s
+    now_dt = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
     for s in servers:
         ip = s["ip_address"]
-        count_flag = '-n' if platform.system().lower().startswith('win') else '-c'
-        try:
-            result = subprocess.run(['ping', count_flag, '1', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-            alive = 1 if result.returncode == 0 else 0
-        except Exception:
+        last = (s["last_ping_at"] or "").strip() if isinstance(s["last_ping_at"], str) else (s["last_ping_at"] or "")
+        should_ping = False
+        if ACTIVE_PING_ENABLED:
+            try:
+                # Parse last_ping_at and check age
+                fmt = "%Y-%m-%d %H:%M:%S"
+                last_dt = datetime.datetime.strptime(last, fmt) if last else None
+                age_ok = True if last_dt is None else (datetime.datetime.now() - last_dt).total_seconds() >= 60
+                should_ping = age_ok
+            except Exception:
+                should_ping = True
+        if should_ping:
+            count_flag = '-n' if platform.system().lower().startswith('win') else '-c'
             alive = 0
-        now_dt = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
-        try:
-            c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now_dt, s["id"]))
-        except Exception:
-            pass
+            try:
+                # Two attempts to reduce false negatives
+                for _ in range(2):
+                    result = subprocess.run(['ping', count_flag, '1', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+                    if result.returncode == 0:
+                        alive = 1
+                        break
+            except Exception:
+                alive = 0
+            try:
+                c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now_dt, s["id"]))
+            except Exception:
+                pass
+            # log ping result
+            try:
+                write_ping_log(ip, bool(alive), source='server_view_refresh', server_id=s["id"], name=s["name"])
+            except Exception:
+                pass
     conn.commit()
 
     c.execute(base_sql, params)
@@ -869,7 +1184,7 @@ def ping_server(server_id):
     user = get_current_user()
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT id, ip_address, location FROM servers WHERE id=?", (server_id,))
+    c.execute("SELECT id, name, ip_address, location FROM servers WHERE id=?", (server_id,))
     row = c.fetchone()
     if not row:
         conn.close()
@@ -888,6 +1203,11 @@ def ping_server(server_id):
     c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now, server_id))
     conn.commit()
     conn.close()
+    # log ping result
+    try:
+        write_ping_log(ip, bool(alive), source='manual_ping', server_id=server_id, name=row["name"] if isinstance(row, (sqlite3.Row, dict)) and "name" in row.keys() else None)
+    except Exception:
+        pass
     flash(f"Ping {'success' if alive else 'failed'} for {ip}.", "info")
     return redirect(url_for('server'))
 
@@ -936,28 +1256,56 @@ def api_servers_status():
     c.execute(base_sql, params)
     servers = c.fetchall()
 
-    count_flag = '-n' if platform.system().lower().startswith('win') else '-c'
     now_dt = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
     statuses = []
     for s in servers:
         ip = s["ip_address"]
-        try:
-            result = subprocess.run(['ping', count_flag, '1', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-            alive = 1 if result.returncode == 0 else 0
-        except Exception:
+        last = (s["last_ping_at"] or "").strip() if isinstance(s["last_ping_at"], str) else (s["last_ping_at"] or "")
+        do_ping = False
+        if ACTIVE_PING_ENABLED:
+            try:
+                fmt = "%Y-%m-%d %H:%M:%S"
+                last_dt = datetime.datetime.strptime(last, fmt) if last else None
+                do_ping = True if last_dt is None else (datetime.datetime.now() - last_dt).total_seconds() >= 60
+            except Exception:
+                do_ping = True
+        if do_ping:
+            count_flag = '-n' if platform.system().lower().startswith('win') else '-c'
             alive = 0
-        try:
-            c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now_dt, s["id"]))
-        except Exception:
-            pass
-        statuses.append({
-            "id": s["id"],
-            "name": s["name"],
-            "ip_address": s["ip_address"],
-            "location": s["location"],
-            "alive": bool(alive),
-            "last_ping_at": now_dt
-        })
+            try:
+                for _ in range(2):
+                    result = subprocess.run(['ping', count_flag, '1', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+                    if result.returncode == 0:
+                        alive = 1
+                        break
+            except Exception:
+                alive = 0
+            try:
+                c.execute("UPDATE servers SET alive=?, last_ping_at=? WHERE id=?", (alive, now_dt, s["id"]))
+            except Exception:
+                pass
+            # log ping result
+            try:
+                write_ping_log(ip, bool(alive), source='api_servers_status', server_id=s["id"], name=s["name"])
+            except Exception:
+                pass
+            statuses.append({
+                "id": s["id"],
+                "name": s["name"],
+                "ip_address": s["ip_address"],
+                "location": s["location"],
+                "alive": bool(alive),
+                "last_ping_at": now_dt
+            })
+        else:
+            statuses.append({
+                "id": s["id"],
+                "name": s["name"],
+                "ip_address": s["ip_address"],
+                "location": s["location"],
+                "alive": bool(s["alive"]),
+                "last_ping_at": s["last_ping_at"]
+            })
     conn.commit()
     conn.close()
     return jsonify({"servers": statuses})
@@ -1014,6 +1362,263 @@ def server_history():
     conn.close()
     
     return render_template('server_history.html', records=history_records)
+
+# Ensure API user from environment (optional)
+try:
+    ensure_api_user_seed()
+except Exception:
+    pass
+
+# ---------- Users Management (Super Admin only) ----------
+@app.route('/users')
+@login_required
+@super_admin_required
+def users_page():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, name, email, role, location FROM users ORDER BY name")
+    rows = c.fetchall()
+    conn.close()
+    return render_template('users.html', users=rows, user=get_current_user())
+
+
+@app.route('/users/create', methods=['GET', 'POST'])
+@login_required
+@super_admin_required
+def create_user():
+    if request.method == 'GET':
+        # Allow preselecting role via query param, e.g. /users/create?role=api
+        default_role = request.args.get('role', 'admin')
+        form = {"role": default_role}
+        return render_template('user_form.html', mode='create', locations=get_locations(), form=form, user=get_current_user())
+
+    name = request.form.get('name', '').strip()
+    email = request.form.get('email', '').strip().lower()
+    role = request.form.get('role', '').strip()
+    location = request.form.get('location', '').strip()
+    password = request.form.get('password', '')
+
+    if not name or not email or not role or not password:
+        flash('Name, Email, Role and Password are required.', 'warning')
+        return redirect(url_for('create_user'))
+
+    if role in ('super_admin', 'api'):
+        location = None
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT 1 FROM users WHERE email=?", (email,))
+        if c.fetchone():
+            conn.close()
+            flash('Email already exists.', 'danger')
+            return redirect(url_for('create_user'))
+        from werkzeug.security import generate_password_hash
+        pw_hash = generate_password_hash(password)
+        c.execute(
+            "INSERT INTO users(name, email, password_hash, role, location) VALUES(?, ?, ?, ?, ?)",
+            (name, email, pw_hash, role, location)
+        )
+        conn.commit()
+        flash('User created.', 'success')
+    except Exception as e:
+        conn.rollback()
+        flash(f'Failed to create user: {e}', 'danger')
+    finally:
+        conn.close()
+    return redirect(url_for('users_page'))
+
+
+@app.route('/users/edit/<int:user_id>', methods=['GET', 'POST'])
+@login_required
+@super_admin_required
+def edit_user(user_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    if request.method == 'GET':
+        c.execute("SELECT id, name, email, role, location FROM users WHERE id=?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            flash('User not found.', 'danger')
+            return redirect(url_for('users_page'))
+        form = {"id": row["id"], "name": row["name"], "email": row["email"], "role": row["role"], "location": row["location"]}
+        return render_template('user_form.html', mode='edit', form=form, locations=get_locations(), user=get_current_user())
+
+    # POST
+    name = request.form.get('name', '').strip()
+    email = request.form.get('email', '').strip().lower()
+    role = request.form.get('role', '').strip()
+    location = request.form.get('location', '').strip()
+    password = request.form.get('password', '')
+
+    if not name or not email or not role:
+        conn.close()
+        flash('Name, Email and Role are required.', 'warning')
+        return redirect(url_for('edit_user', user_id=user_id))
+
+    if role in ('super_admin', 'api'):
+        location = None
+
+    try:
+        # Ensure email uniqueness for other users
+        c.execute("SELECT id FROM users WHERE email=? AND id<>?", (email, user_id))
+        if c.fetchone():
+            conn.close()
+            flash('Another user with this email already exists.', 'danger')
+            return redirect(url_for('edit_user', user_id=user_id))
+
+        if password:
+            from werkzeug.security import generate_password_hash
+            pw_hash = generate_password_hash(password)
+            c.execute("UPDATE users SET name=?, email=?, password_hash=?, role=?, location=? WHERE id=?",
+                      (name, email, pw_hash, role, location, user_id))
+        else:
+            c.execute("UPDATE users SET name=?, email=?, role=?, location=? WHERE id=?",
+                      (name, email, role, location, user_id))
+        conn.commit()
+        flash('User updated.', 'success')
+    except Exception as e:
+        conn.rollback()
+        flash(f'Failed to update user: {e}', 'danger')
+    finally:
+        conn.close()
+    return redirect(url_for('users_page'))
+
+
+@app.route('/users/delete/<int:user_id>', methods=['POST'])
+@login_required
+@super_admin_required
+def delete_user(user_id):
+    current = get_current_user()
+    if current and current["id"] == user_id:
+        flash('You cannot delete your own account while logged in.', 'warning')
+        return redirect(url_for('users_page'))
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM users WHERE id=?", (user_id,))
+        conn.commit()
+        flash('User deleted.', 'success')
+    except Exception as e:
+        conn.rollback()
+        flash(f'Failed to delete user: {e}', 'danger')
+    finally:
+        conn.close()
+    return redirect(url_for('users_page'))
+
+# ---------- Remote Metrics Ingestion (Basic Auth) ----------
+@app.route('/api/ingest-metrics', methods=['POST'])
+def api_ingest_metrics():
+    t0 = time.time()
+    ok, result = require_basic_auth_api()
+    if not ok:
+        return result
+    t_auth = time.time()
+
+    # Expect JSON body
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "invalid json"}), 400
+
+    if not isinstance(payload, dict):
+        return jsonify({"error": "invalid payload"}), 400
+
+    server_id = payload.get('server_id')
+    name = payload.get('name')
+    ip_address = payload.get('ip_address')
+    cpu_usage = payload.get('cpu_usage')
+    memory_usage = payload.get('memory_usage')
+    total_disk = payload.get('total_disk')
+    used_disk = payload.get('used_disk')
+    disk_percent = payload.get('disk_percent')
+    ts = payload.get('timestamp')
+
+    if not (server_id or (name and ip_address)):
+        return jsonify({"error": "server_id or (name and ip_address) required"}), 400
+
+    # Resolve server using a short-lived connection
+    row = None
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        if server_id:
+            try:
+                c.execute("SELECT id, name FROM servers WHERE id=?", (int(server_id),))
+                row = c.fetchone()
+            except Exception:
+                row = None
+        if not row and name and ip_address:
+            c.execute("SELECT id, name FROM servers WHERE name=? AND ip_address=?", (str(name).strip(), str(ip_address).strip()))
+            row = c.fetchone()
+        # If still not found, optionally auto-create a server record with empty location
+        if not row and name and ip_address:
+            try:
+                c.execute("INSERT INTO servers(name, ip_address, location, alive, last_ping_at) VALUES(?, ?, ?, ?, ?)",
+                          (str(name).strip(), str(ip_address).strip(), '', 1, datetime.datetime.now().isoformat(sep=' ', timespec='seconds')))
+                conn.commit()
+                c.execute("SELECT id, name FROM servers WHERE name=? AND ip_address=?", (str(name).strip(), str(ip_address).strip()))
+                row = c.fetchone()
+            except Exception:
+                pass
+    finally:
+        conn.close()
+
+    if not row:
+        return jsonify({"error": "server not found"}), 404
+    t_resolve = time.time()
+
+    # Enqueue the write and return immediately (decouples clients from DB locks)
+    # Always use server-side timestamp with milliseconds to avoid duplicate keys
+    now = datetime.datetime.now().isoformat(sep=' ', timespec='milliseconds')
+    # Determine ingestion kind: windows metrics if c_* fields present or os == 'windows'
+    os_hint = str(payload.get('os') or payload.get('platform') or '').strip().lower()
+    is_windows = os_hint == 'windows' or any(k in payload for k in ('c_total_gb','c_used_gb','c_percent','total_drives'))
+    if is_windows:
+        task = {
+            'kind': 'windows',
+            'server_id': row['id'],
+            'cpu_usage': cpu_usage,
+            'memory_usage': memory_usage,
+            'total_drives': payload.get('total_drives'),
+            'c_total_gb': payload.get('c_total_gb'),
+            'c_used_gb': payload.get('c_used_gb'),
+            'c_percent': payload.get('c_percent'),
+            'ts': now,
+        }
+    else:
+        task = {
+            'kind': 'linux',
+            'server_id': row['id'],
+            'cpu_usage': cpu_usage,
+            'memory_usage': memory_usage,
+            'total_disk': total_disk,
+            'used_disk': used_disk,
+            'disk_percent': disk_percent,
+            'ts': now,
+        }
+    try:
+        INGEST_QUEUE.append(task)
+        INGEST_EVENT.set()
+        INGEST_STATS['enqueued'] += 1
+    except Exception:
+        return jsonify({"error": "queue_failed"}), 500
+
+    t_done = time.time()
+    print(f"[ingest] auth={t_auth-t0:.3f}s resolve={t_resolve-t_auth:.3f}s queued={(t_done-t_resolve):.3f}s total={t_done-t0:.3f}s")
+    return jsonify({"ok": True, "queued": True, "server_id": row['id'], "name": row['name'], "saved_at": now}), 202
+
+# ---------- Ingestion Health ----------
+@app.route('/api/ingest-health')
+def api_ingest_health():
+    try:
+        qlen = len(INGEST_QUEUE)
+    except Exception:
+        qlen = -1
+    return jsonify({
+        'queue_length': qlen,
+        'stats': INGEST_STATS,
+    })
 
 # ---------- Server Metrics APIs ----------
 @app.route('/api/server-metrics', methods=['GET'])
@@ -1124,11 +1729,41 @@ def api_server_status_latest():
         SELECT s.id as server_id, s.name, s.ip_address, s.location,
                st.cpu_usage, st.memory_usage, st.total_disk, st.used_disk, st.disk_percent, st.last_updated
         FROM servers s
-        LEFT JOIN (
+        INNER JOIN (
             SELECT t1.* FROM server_status t1
             JOIN (
                 SELECT server_id, MAX(last_updated) as max_ts
                 FROM server_status
+                GROUP BY server_id
+            ) t2 ON t1.server_id = t2.server_id AND t1.last_updated = t2.max_ts
+        ) st ON st.server_id = s.id
+    """
+    params = []
+    if user and user["role"] in ("admin", "analytics"):
+        base_sql += " WHERE LOWER(s.location)=LOWER(?)"
+        params.append(user["location"] or "")
+    base_sql += " ORDER BY s.name"
+    c.execute(base_sql, params)
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return jsonify({"server_status": rows})
+
+@app.route('/api/server-status/latest-windows')
+@login_required
+def api_server_status_latest_windows():
+    """Return latest Windows server_status per server, with RBAC filtering."""
+    user = get_current_user()
+    conn = get_db_connection()
+    c = conn.cursor()
+    base_sql = """
+        SELECT s.id as server_id, s.name, s.ip_address, s.location,
+               st.cpu_usage, st.memory_usage, st.total_drives, st.c_total_gb, st.c_used_gb, st.c_percent, st.last_updated
+        FROM servers s
+        INNER JOIN (
+            SELECT t1.* FROM server_status_windows t1
+            JOIN (
+                SELECT server_id, MAX(last_updated) as max_ts
+                FROM server_status_windows
                 GROUP BY server_id
             ) t2 ON t1.server_id = t2.server_id AND t1.last_updated = t2.max_ts
         ) st ON st.server_id = s.id
@@ -1608,27 +2243,44 @@ def _watch_servers_and_alert(interval_seconds=60, repeat_minutes=5, send_recover
                 c.execute("SELECT email_address, last_alert_sent FROM server_alerts WHERE server_id=?", (sid,))
                 alerts = c.fetchall()
                 if offline:
-                    # Immediate and repeated alerts
+                    # Immediate and repeated alerts, race-safe: acquire 'send right' via UPDATE first
                     for a in alerts:
                         email = a[0]
                         last_sent = a[1]
-                        should_send = False
-                        if not last_sent:
-                            should_send = True
-                        else:
-                            try:
-                                last_dt = datetime.datetime.fromisoformat(last_sent)
-                            except Exception:
-                                last_dt = None
-                            if not last_dt or (now - last_dt).total_seconds() >= repeat_minutes * 60:
-                                should_send = True
-                        if should_send:
-                            subject = f"[ALERT] Server OFFLINE: {s['name']}"
-                            body = _format_server_summary(s) + f"\nStatus: Offline\nTimestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}\nServer has gone offline."
-                            ok, err = _send_server_email(email, subject, body)
-                            if ok:
-                                c.execute("UPDATE server_alerts SET last_alert_sent=? WHERE server_id=? AND email_address=?", (now.isoformat(sep=' ', timespec='seconds'), sid, email))
+                        # Determine threshold time
+                        threshold = now - datetime.timedelta(minutes=repeat_minutes)
+                        threshold_iso = threshold.isoformat(sep=' ', timespec='seconds')
+                        # Try to atomically claim a send by updating last_alert_sent only if due
+                        try:
+                            c.execute(
+                                """
+                                UPDATE server_alerts
+                                SET last_alert_sent=?
+                                WHERE server_id=? AND email_address=?
+                                  AND (
+                                        last_alert_sent IS NULL OR last_alert_sent < ?
+                                      )
+                                """,
+                                (now.isoformat(sep=' ', timespec='seconds'), sid, email, threshold_iso)
+                            )
+                            claimed = (c.rowcount == 1)
+                            if claimed:
                                 conn.commit()
+                        except Exception:
+                            claimed = False
+                        if not claimed:
+                            continue
+                        # We have the send right; send email
+                        subject = f"[ALERT] Server OFFLINE: {s['name']}"
+                        body = _format_server_summary(s) + f"\nStatus: Offline\nTimestamp: {now.strftime('%Y-%m-%d %H:%M:%S')}\nServer has gone offline."
+                        ok, err = _send_server_email(email, subject, body)
+                        if not ok:
+                            # On failure, roll back claim to allow future retries
+                            try:
+                                c.execute("UPDATE server_alerts SET last_alert_sent=NULL WHERE server_id=? AND email_address=? AND last_alert_sent=?", (sid, email, now.isoformat(sep=' ', timespec='seconds')))
+                                conn.commit()
+                            except Exception:
+                                pass
                     _prev_offline[sid] = True
                 else:
                     # Recovery path if previously offline

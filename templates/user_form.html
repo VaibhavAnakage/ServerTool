@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ 'Create User' if mode == 'create' else 'Edit User' }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+<header>
+    <div class="container">
+        <h1>{{ 'Create User' if mode == 'create' else 'Edit User' }}</h1>
+    </div>
+</header>
+<nav>
+    <div class="container">
+        <ul>
+            <li><a href="/">Dashboard</a></li>
+            <li><a href="/domain">Domain Monitoring</a></li>
+            <li><a href="/server">Server Info</a></li>
+            <li><a href="/server/history">Server History</a></li>
+            <li><a href="/run_alerts">Run Alerts</a></li>
+            {% if user and (user.role or '').lower() == 'super_admin' %}
+                <li><a href="/users">Users</a></li>
+            {% endif %}
+            {% if user %}
+                <li style="margin-left:auto"><a href="/logout">Logout ({{ user.name }})</a></li>
+            {% else %}
+                <li style="margin-left:auto"><a href="/login">Login</a></li>
+            {% endif %}
+        </ul>
+    </div>
+</nav>
+<div class="container">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }}">
+            <strong>{{ category.title() }}:</strong> {{ message }}
+          </div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <div class="card">
+        <h2>{{ 'Add New User' if mode == 'create' else 'Update User' }}</h2>
+        <form method="POST" action="{{ '/users/create' if mode == 'create' else ('/users/edit/' ~ form.id) }}" style="display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px;">
+            <div>
+                <label>Name</label>
+                <input type="text" name="name" class="form-control" required value="{{ form.name or '' }}">
+            </div>
+            <div>
+                <label>Email</label>
+                <input type="email" name="email" class="form-control" required value="{{ form.email or '' }}">
+            </div>
+            <div>
+                <label>Role</label>
+                <select name="role" id="role" class="form-control" required>
+                    {% set r = (form.role or 'admin') if form else 'admin' %}
+                    <option value="super_admin" {% if r=='super_admin' %}selected{% endif %}>Super Admin</option>
+                    <option value="admin" {% if r=='admin' %}selected{% endif %}>Admin</option>
+                    <option value="analytics" {% if r=='analytics' %}selected{% endif %}>Analytics</option>
+                    <option value="api" {% if r=='api' %}selected{% endif %}>API (ingestion only)</option>
+                </select>
+            </div>
+            <div id="locationField">
+                <label>Location</label>
+                <select name="location" class="form-control">
+                    {% for loc in locations %}
+                        <option value="{{ loc }}" {% if form and form.location == loc %}selected{% endif %}>{{ loc }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label>Password {% if mode=='edit' %}(leave blank to keep unchanged){% endif %}</label>
+                <input type="password" name="password" class="form-control" {% if mode=='create' %}required{% endif %}>
+            </div>
+            <div style="grid-column: 1 / -1; display:flex; gap:10px;">
+                <button type="submit" class="btn btn-primary">{{ 'Create' if mode == 'create' else 'Save' }}</button>
+                <a href="/users" class="btn btn-secondary">Cancel</a>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+function toggleLocation() {
+  const role = document.getElementById('role').value;
+  const loc = document.getElementById('locationField');
+  if (role === 'super_admin' || role === 'api') {
+    loc.style.display = 'none';
+  } else {
+    loc.style.display = '';
+  }
+}
+
+(function(){
+  try{
+    toggleLocation();
+    document.getElementById('role').addEventListener('change', toggleLocation);
+  }catch(e){}
+})();
+</script>
+</body>
+</html>
