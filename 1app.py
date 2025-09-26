@@ -13,8 +13,15 @@ except NameError:
 DB_FILE = os.environ.get('MONITORING_DB_PATH', 'monitoring.db')
 
 def net_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute('PRAGMA journal_mode=WAL;')
+        conn.execute('PRAGMA synchronous=NORMAL;')
+        conn.execute('PRAGMA busy_timeout=5000;')
+        conn.execute('PRAGMA foreign_keys=ON;')
+    except Exception:
+        pass
     return conn
 
 # Provide get_db_connection early for modules that expect it
@@ -31,6 +38,7 @@ def ensure_network_schema():
         CREATE TABLE IF NOT EXISTS network_device (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT UNIQUE NOT NULL,
+            name TEXT,
             mac TEXT,
             manufacturer TEXT,
             added_at TEXT,
@@ -59,11 +67,37 @@ def ensure_network_schema():
             sent_email INTEGER DEFAULT 0,
             FOREIGN KEY(device_id) REFERENCES network_device(id) ON DELETE CASCADE
         );
+        -- Linux system info table (per-server snapshots)
+        CREATE TABLE IF NOT EXISTS linux_system_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         """
     )
     # Add device_type column if not exists
     try:
         c.execute("ALTER TABLE network_device ADD COLUMN device_type TEXT")
+    except Exception:
+        pass
+    # Add name column if not exists (for older DBs)
+    try:
+        c.execute("ALTER TABLE network_device ADD COLUMN name TEXT")
+    except Exception:
+        pass
+    # Ensure linux_system_info has required columns when table already existed
+    try:
+        c.execute("ALTER TABLE linux_system_info ADD COLUMN payload TEXT")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE linux_system_info ADD COLUMN created_at TEXT")
+    except Exception:
+        pass
+    # Some older schemas may have payload_json instead of payload
+    try:
+        c.execute("ALTER TABLE linux_system_info ADD COLUMN payload_json TEXT")
     except Exception:
         pass
     conn.commit(); conn.close()
@@ -76,6 +110,130 @@ def _run_cmd(cmd, timeout=20):
         return out.returncode, out.stdout.strip(), out.stderr.strip()
     except Exception as e:
         return -1, "", str(e)
+
+# ================= Linux System Info API (Basic Auth) =================
+import base64, json
+
+# Simple retry helper to mitigate transient 'database is locked'
+def _db_exec_retry(conn, sql, params=(), retries=5, delay=0.1):
+    import sqlite3 as _sqlite3, time as _time
+    for i in range(max(1, retries)):
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            return cur
+        except _sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower() and i < retries-1:
+                _time.sleep(delay * (i+1))
+                continue
+            raise
+
+def _check_basic_auth(req) -> bool:
+    auth = req.headers.get('Authorization')
+    if not auth or not auth.startswith('Basic '):
+        return False
+    try:
+        decoded = base64.b64decode(auth.split(' ',1)[1]).decode('utf-8')
+        user, pwd = decoded.split(':', 1)
+    except Exception:
+        return False
+    # Defaults aligned with provided Linux agent script
+    want_user = os.environ.get('LINUX_INFO_USER', 'anakage_api@anakage.com')
+    want_pass = os.environ.get('LINUX_INFO_PASS', 'Test#123')
+    return user == want_user and pwd == want_pass
+
+def _unauthorized_response():
+    from flask import Response
+    resp = Response('Unauthorized', 401)
+    resp.headers['WWW-Authenticate'] = 'Basic realm="Linux System Info"'
+    return resp
+
+@app.route('/api/linux-system-info', methods=['POST'])
+def api_linux_system_info_ingest():
+    # Basic auth
+    if not _check_basic_auth(request):
+        return _unauthorized_response()
+    # Link to server_id via query or JSON
+    server_id = request.args.get('server_id', type=int)
+    if server_id is None:
+        try:
+            j = request.get_json(force=True, silent=True) or {}
+            server_id = int(j.get('server_id')) if j.get('server_id') is not None else None
+        except Exception:
+            server_id = None
+    if server_id is None:
+        return jsonify({"error": "server_id required (query or JSON)"}), 400
+    # Store full JSON payload as text
+    payload = request.get_data(as_text=True) or '{}'
+    # Validate JSON
+    try:
+        json.loads(payload)
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+    conn = get_db_connection(); c = conn.cursor()
+    now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+    # Detect available columns to support legacy schemas (payload vs payload_json, collected_at vs created_at)
+    cols = set(r[1] for r in c.execute("PRAGMA table_info(linux_system_info)").fetchall())
+    try:
+        has_payload_json = 'payload_json' in cols
+        has_payload = 'payload' in cols
+        both_ts = 'created_at' in cols and 'collected_at' in cols
+        if has_payload_json and has_payload:
+            if both_ts:
+                _db_exec_retry(conn, "INSERT INTO linux_system_info(server_id, payload_json, payload, created_at, collected_at) VALUES(?,?,?,?,?)", (server_id, payload, payload, now, now))
+            elif 'collected_at' in cols:
+                _db_exec_retry(conn, "INSERT INTO linux_system_info(server_id, payload_json, payload, collected_at) VALUES(?,?,?,?)", (server_id, payload, payload, now))
+            else:
+                _db_exec_retry(conn, "INSERT INTO linux_system_info(server_id, payload_json, payload, created_at) VALUES(?,?,?,?)", (server_id, payload, payload, now))
+        else:
+            payload_col = 'payload_json' if has_payload_json else 'payload'
+            if both_ts:
+                _db_exec_retry(conn, f"INSERT INTO linux_system_info(server_id, {payload_col}, created_at, collected_at) VALUES(?,?,?,?)", (server_id, payload, now, now))
+            elif 'collected_at' in cols:
+                _db_exec_retry(conn, f"INSERT INTO linux_system_info(server_id, {payload_col}, collected_at) VALUES(?,?,?)", (server_id, payload, now))
+            else:
+                _db_exec_retry(conn, f"INSERT INTO linux_system_info(server_id, {payload_col}, created_at) VALUES(?,?,?)", (server_id, payload, now))
+    except (sqlite3.OperationalError, sqlite3.IntegrityError):
+        # Final fallback: try alternate timestamp column name and ensure both payload columns filled if both exist
+        has_payload_json = 'payload_json' in cols
+        has_payload = 'payload' in cols
+        if has_payload_json and has_payload:
+            if 'collected_at' in cols:
+                _db_exec_retry(conn, "INSERT INTO linux_system_info(server_id, payload_json, payload, created_at) VALUES(?,?,?,?)", (server_id, payload, payload, now))
+            else:
+                _db_exec_retry(conn, "INSERT INTO linux_system_info(server_id, payload_json, payload, collected_at) VALUES(?,?,?,?)", (server_id, payload, payload, now))
+        else:
+            payload_col = 'payload_json' if has_payload_json else 'payload'
+            if 'collected_at' in cols:
+                _db_exec_retry(conn, f"INSERT INTO linux_system_info(server_id, {payload_col}, created_at) VALUES(?,?,?)", (server_id, payload, now))
+            else:
+                _db_exec_retry(conn, f"INSERT INTO linux_system_info(server_id, {payload_col}, collected_at) VALUES(?,?,?)", (server_id, payload, now))
+    conn.commit(); conn.close()
+    return jsonify({"ok": True})
+
+@app.route('/api/linux-system-info', methods=['GET'])
+def api_linux_system_info_get():
+    server_id = request.args.get('server_id', type=int)
+    if server_id is None:
+        return jsonify({"error": "server_id required"}), 400
+    conn = get_db_connection(); c = conn.cursor()
+    cols = set(r[1] for r in c.execute("PRAGMA table_info(linux_system_info)").fetchall())
+    # Select payload with COALESCE across payload_json and payload
+    payload_sel = "COALESCE(payload_json, payload)"
+    if 'created_at' in cols and 'collected_at' in cols:
+        c.execute(f"SELECT {payload_sel}, COALESCE(created_at, collected_at) FROM linux_system_info WHERE server_id=? ORDER BY id DESC LIMIT 1", (server_id,))
+    elif 'created_at' in cols:
+        c.execute(f"SELECT {payload_sel}, created_at FROM linux_system_info WHERE server_id=? ORDER BY id DESC LIMIT 1", (server_id,))
+    else:
+        c.execute(f"SELECT {payload_sel}, collected_at FROM linux_system_info WHERE server_id=? ORDER BY id DESC LIMIT 1", (server_id,))
+    row = c.fetchone(); conn.close()
+    if not row:
+        return jsonify({"exists": False})
+    try:
+        data = json.loads(row[0])
+    except Exception:
+        data = {"raw": row[0]}
+    return jsonify({"exists": True, "created_at": row[1], "data": data})
 
 def _ping_ip(ip: str, count: int = 4):
     # Windows ping: -n, Linux: -c
@@ -179,23 +337,25 @@ def _network_monitor_loop():
             for did, ip, enabled, last_status, last_rtt, mac, manufacturer in c.fetchall():
                 status, rtt, detail = _ping_ip(ip, count=1)
                 now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
-                c.execute("INSERT INTO network_check(device_id,kind,status,detail_text,created_at) VALUES(?,?,?,?,?)",
+                _db_exec_retry(conn, "INSERT INTO network_check(device_id,kind,status,detail_text,created_at) VALUES(?,?,?,?,?)",
                           (did, 'ping', status, detail, now))
                 # Detect changes
                 if last_status != status:
                     _network_alert(conn, did, f"Device {ip} changed status: {last_status} -> {status}")
-                    c.execute("UPDATE network_device SET last_status=?, last_rtt_ms=?, last_change_at=? WHERE id=?",
+                    _db_exec_retry(conn, "UPDATE network_device SET last_status=?, last_rtt_ms=?, last_change_at=? WHERE id=?",
                               (status, rtt, now, did))
                 else:
-                    c.execute("UPDATE network_device SET last_status=?, last_rtt_ms=? WHERE id=?",
+                    _db_exec_retry(conn, "UPDATE network_device SET last_status=?, last_rtt_ms=? WHERE id=?",
                               (status, rtt, did))
                 # Enrich missing MAC/vendor opportunistically
                 if not mac or not manufacturer:
                     new_mac, new_vendor = _resolve_mac_and_vendor(ip)
                     if new_mac or new_vendor:
-                        c.execute("UPDATE network_device SET mac=COALESCE(?, mac), manufacturer=COALESCE(?, manufacturer) WHERE id=?",
+                        _db_exec_retry(conn, "UPDATE network_device SET mac=COALESCE(?, mac), manufacturer=COALESCE(?, manufacturer) WHERE id=?",
                                   (new_mac, new_vendor, did))
-            conn.commit(); conn.close()
+                # Commit per-device to reduce lock duration
+                conn.commit()
+            conn.close()
         except Exception:
             traceback.print_exc()
         time.sleep(8)
@@ -217,14 +377,15 @@ def api_network_devices():
     if request.method == 'POST':
         ip = request.form.get('ip') or (request.json and request.json.get('ip'))
         device_type = request.form.get('device_type') or (request.json and request.json.get('device_type'))
+        name = request.form.get('name') or (request.json and request.json.get('name'))
         if not ip:
             return jsonify({"error": "ip required"}), 400
         mac, vendor = _resolve_mac_and_vendor(ip)
         now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
         conn = get_db_connection(); c = conn.cursor()
         try:
-            c.execute("INSERT INTO network_device(ip, mac, manufacturer, added_at, enabled, device_type) VALUES(?,?,?,?,1,?)",
-                      (ip, mac, vendor, now, device_type))
+            c.execute("INSERT INTO network_device(ip, name, mac, manufacturer, added_at, enabled, device_type) VALUES(?,?,?,?,?,1,?)",
+                      (ip, name, mac, vendor, now, device_type))
             conn.commit()
             return jsonify({"ok": True}), 201
         except sqlite3.IntegrityError:
@@ -233,10 +394,25 @@ def api_network_devices():
             conn.close()
     # GET list
     conn = get_db_connection(); c = conn.cursor()
-    c.execute("SELECT id, ip, mac, manufacturer, device_type, enabled, last_status, last_rtt_ms, last_change_at FROM network_device ORDER BY ip")
+    c.execute("SELECT id, ip, name, mac, manufacturer, device_type, enabled, last_status, last_rtt_ms, last_change_at FROM network_device ORDER BY ip")
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return jsonify({"devices": rows})
+
+@app.route('/api/network/devices/clear', methods=['POST'])
+def api_network_devices_clear():
+    conn = get_db_connection(); c = conn.cursor()
+    try:
+        c.execute("DELETE FROM network_check")
+        c.execute("DELETE FROM network_alert")
+        c.execute("DELETE FROM network_device")
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
 
 @app.route('/api/network/device/<int:device_id>/checks')
 def api_network_device_checks(device_id: int):

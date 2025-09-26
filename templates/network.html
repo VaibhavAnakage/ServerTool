@@ -47,6 +47,8 @@
       <div class="controls">
         <label for="device-ip"><strong>Enter Device IP Address:</strong></label>
         <input type="text" id="device-ip" name="device-ip" class="form-control" placeholder="192.168.1.10" style="min-width:200px;">
+        <label for="device-name"><strong>Name:</strong></label>
+        <input type="text" id="device-name" class="form-control" placeholder="e.g., Core Router" style="min-width:200px;">
         <label for="device-type"><strong>Type:</strong></label>
         <select id="device-type" class="form-control" style="min-width:180px;">
           <option value="">Select type</option>
@@ -61,6 +63,7 @@
           <option>Other</option>
         </select>
         <button id="add-device" class="btn btn-primary">Add Device</button>
+        <button id="clear-devices" class="btn btn-secondary" title="Remove all devices and related history">Clear All</button>
         <span id="add-note" class="muted"></span>
       </div>
     </div>
@@ -71,6 +74,7 @@
         <table>
           <thead>
             <tr>
+              <th>Name</th>
               <th>IP</th>
               <th>MAC</th>
               <th>Manufacturer</th>
@@ -146,27 +150,27 @@
       const tr = document.createElement('tr');
       tr.innerHTML = '<td colspan="8" class="muted">No devices yet. Add your first device above.</td>';
       tb.appendChild(tr);
-      return;
     }
     items.forEach(d => {
       const tr = document.createElement('tr');
       tr.dataset.id = d.id;
       tr.innerHTML = `
+        <td>${h(d.name)}</td>
         <td>${h(d.ip)}</td>
         <td>${h(d.mac)}</td>
         <td>${h(d.manufacturer)}</td>
         <td>${h(d.device_type)}</td>
-        <td>${d.last_status ? `<span class="pill ${d.last_status==='Alive'?'ok':'bad'}">${d.last_status}</span>` : '-'}</td>
+        <td>${d.last_status ? `<span class=\"pill ${d.last_status==='Alive'?'ok':'bad'}\">${d.last_status}</span>` : '-'}</td>
         <td>${d.last_rtt_ms==null?'-':d.last_rtt_ms}</td>
         <td>${h(d.last_change_at)}</td>
-        <td class="btn-row">
-          <button class="btn btn-sm btn-secondary act" data-act="ping">Ping</button>
-          <button class="btn btn-sm btn-secondary act" data-act="traceroute">Traceroute</button>
-          <button class="btn btn-sm btn-secondary act" data-act="nmap">Ports</button>
-          <button class="btn btn-sm btn-secondary act" data-act="os_fingerprint">OS</button>
-          <button class="btn btn-sm btn-secondary act" data-act="http_headers">HTTP</button>
-          <button class="btn btn-sm btn-secondary act" data-act="tls_info">TLS</button>
-          <button class="btn btn-sm btn-secondary act" data-act="snmp">SNMP</button>
+        <td class=\"btn-row\">
+          <button class=\"btn btn-sm btn-secondary act\" data-act=\"ping\">Ping</button>
+          <button class=\"btn btn-sm btn-secondary act\" data-act=\"traceroute\">Traceroute</button>
+          <button class=\"btn btn-sm btn-secondary act\" data-act=\"nmap\">Ports</button>
+          <button class=\"btn btn-sm btn-secondary act\" data-act=\"os_fingerprint\">OS</button>
+          <button class=\"btn btn-sm btn-secondary act\" data-act=\"http_headers\">HTTP</button>
+          <button class=\"btn btn-sm btn-secondary act\" data-act=\"tls_info\">TLS</button>
+          <button class=\"btn btn-sm btn-secondary act\" data-act=\"snmp\">SNMP</button>
         </td>`;
       tr.addEventListener('click', () => {
         selectedDeviceId = d.id; selectedIP = d.ip;
@@ -182,13 +186,14 @@
   async function addDevice(){
     const ip = document.getElementById('device-ip').value.trim();
     const dtype = document.getElementById('device-type').value;
+    const dname = document.getElementById('device-name').value.trim();
     const note = document.getElementById('add-note');
     if(!ip){ note.textContent = 'Enter an IP.'; return; }
     if(!validateIP(ip)) { note.textContent = 'Enter a valid IPv4 address.'; return; }
     note.textContent = 'Adding...';
-    const fd = new FormData(); fd.append('ip', ip); if(dtype) fd.append('device_type', dtype);
+    const fd = new FormData(); fd.append('ip', ip); if(dtype) fd.append('device_type', dtype); if(dname) fd.append('name', dname);
     const res = await fetch('/api/network/devices', {method:'POST', credentials:'same-origin', body: fd});
-    if(res.ok){ note.textContent = 'Added.'; document.getElementById('device-ip').value=''; listDevices(); }
+    if(res.ok){ note.textContent = 'Added.'; document.getElementById('device-ip').value=''; document.getElementById('device-name').value=''; listDevices(); }
     else { note.textContent = 'Failed.'; }
   }
 
@@ -224,6 +229,11 @@
 
   // Event bindings
   document.getElementById('add-device').addEventListener('click', addDevice);
+  document.getElementById('clear-devices').addEventListener('click', async () => {
+    if(!confirm('Remove ALL devices and history?')) return;
+    const res = await fetch('/api/network/devices/clear', {method:'POST', credentials:'same-origin'});
+    if(res.ok){ listDevices(); document.getElementById('result-output').textContent=''; document.getElementById('alerts-body').innerHTML=''; }
+  });
   document.querySelectorAll('.btn-row button[data-act]').forEach(b => {
     b.addEventListener('click', () => runAction(b.dataset.act));
   });

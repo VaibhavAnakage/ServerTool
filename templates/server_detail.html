@@ -6,6 +6,22 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    /* Linux System Info polish */
+    .lsi-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap:16px; }
+    .table { width:100%; border-collapse:collapse; table-layout: fixed; }
+    .table thead th { text-align:left; padding:8px; background:#5b21b6; color:#fff; position:sticky; top:0; z-index:1; }
+    .table tbody td { padding:8px; border-bottom:1px solid #e5e7eb; vertical-align:top; }
+    .table-scroll { height:260px; overflow:auto; border:1px solid #e5e7eb; border-radius:8px; background:#fff; position:relative; }
+    .kv-table td:first-child { width:140px; white-space:nowrap; }
+    .kv-table td.wrap { white-space:pre-wrap; word-break:break-word; }
+    .card > h3 { margin-top:0; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:9999px; font-size:12px; }
+    .badge-danger { background:#fee2e2; color:#991b1b; }
+    .badge-success { background:#dcfce7; color:#166534; }
+    .mono { white-space:pre; height:260px; overflow:auto; border:1px solid #e5e7eb; border-radius:8px; background:#fff; padding:8px; }
+    .truncate { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:block; }
+  </style>
 </head>
 <body>
   <header>
@@ -73,11 +89,104 @@
         <canvas id="cmChart" width="800" height="400" style="width:800px;height:400px;display:block;"></canvas>
       </div>
     </div>
+
+    <div class="card">
+      <h2>Linux System Info</h2>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+        <span id="lsi-updated" style="color:#666;">Last updated: -</span>
+        <label style="display:flex; align-items:center; gap:6px; margin-left:auto;">
+          <input type="checkbox" id="lsiAutoRefreshCbx" checked>
+          Auto-refresh (3m)
+        </label>
+        <button id="lsiRefreshBtn" class="btn btn-secondary">Refresh</button>
+      </div>
+      <div class="lsi-grid">
+        <div class="card">
+          <h3>Identity</h3>
+          <div class="table-scroll">
+          <table class="table kv-table">
+            <tbody id="lsi-identity"></tbody>
+          </table>
+          </div>
+        </div>
+        <div class="card">
+          <h3>System</h3>
+          <div class="table-scroll">
+          <table class="table kv-table">
+            <tbody id="lsi-system"></tbody>
+          </table>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Disk Usage</h3>
+          <div class="table-scroll">
+            <table class="table">
+              <thead><tr><th>FS</th><th>Type</th><th>Size</th><th>Used</th><th>Avail</th><th>Use%</th><th>Mount</th></tr></thead>
+              <tbody id="lsi-disk"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Top Memory Processes</h3>
+          <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+            <input id="memFilter" class="form-control" placeholder="Filter command" style="min-width:200px;">
+            <button class="btn btn-secondary" id="memSortCpu">Sort CPU</button>
+            <button class="btn btn-secondary" id="memSortMem">Sort MEM</button>
+          </div>
+          <div class="table-scroll">
+            <table class="table"><thead><tr><th>PID</th><th>CMD</th><th>%MEM</th><th>%CPU</th></tr></thead>
+              <tbody id="lsi-proc-mem"></tbody></table>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Top CPU Processes</h3>
+          <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+            <input id="cpuFilter" class="form-control" placeholder="Filter command" style="min-width:200px;">
+            <button class="btn btn-secondary" id="cpuSortCpu">Sort CPU</button>
+            <button class="btn btn-secondary" id="cpuSortMem">Sort MEM</button>
+          </div>
+          <div class="table-scroll">
+            <table class="table"><thead><tr><th>PID</th><th>CMD</th><th>%MEM</th><th>%CPU</th></tr></thead>
+              <tbody id="lsi-proc-cpu"></tbody></table>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Services</h3>
+          <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+            <input id="svcFilter" class="form-control" placeholder="Filter service" style="min-width:200px;">
+          </div>
+          <div class="table-scroll">
+            <table class="table"><thead><tr><th>Name</th><th>Loaded</th><th>Active</th><th>State</th></tr></thead>
+              <tbody id="lsi-services"></tbody></table>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Networking</h3>
+          <pre id="lsi-net" class="mono" style="max-height:260px; overflow:auto;"></pre>
+        </div>
+        <div class="card">
+          <h3>Listening Ports</h3>
+          <pre id="lsi-ports" class="mono" style="max-height:260px; overflow:auto;"></pre>
+        </div>
+        <div class="card">
+          <h3>Logged-in Users</h3>
+          <pre id="lsi-users" class="mono" style="max-height:260px; overflow:auto;"></pre>
+        </div>
+        <div class="card">
+          <h3>Mounted Filesystems (Raw)</h3>
+          <pre id="lsi-mounts" class="mono" style="max-height:260px; overflow:auto;"></pre>
+        </div>
+        <div class="card">
+          <h3>System Logs (Tail)</h3>
+          <pre id="lsi-logs" class="mono" style="max-height:260px; overflow:auto;"></pre>
+        </div>
+      </div>
+    </div>
   </div>
 
 <script>
 (function(){
-  const serverId = {{ server.id }};
+  const serverId = {{ server.id | tojson }};
   const cmCtx = document.getElementById('cmChart').getContext('2d');
   const noteEl = document.getElementById('series-note');
 
@@ -184,6 +293,168 @@
     const cb = document.getElementById('autoRefreshCbx');
     if(cb && cb.checked){ loadData(); }
   }, 30000);
+
+  // ---------------- Linux System Info Renderer ----------------
+  const lsi = {
+    serverId: {{ server.id | tojson }},
+    raw: null,
+    parsed: null,
+  };
+
+  function setUpdated(ts){
+    const el = document.getElementById('lsi-updated');
+    if(el) el.textContent = 'Last updated: ' + (ts || '-');
+  }
+
+  function kvRow(k,v){ return `<tr><td><strong>${k}</strong></td><td class="wrap">${(v||'').toString().replace(/</g,'&lt;')}</td></tr>`; }
+
+  function parseDf(text){
+    const rows = [];
+    (text||'').split(/\n/).forEach(line=>{
+      const m = line.match(/^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)%\s+(\S+)/);
+      if(m){
+        rows.push({fs:m[1], type:m[2], size:m[3], used:m[4], avail:m[5], usep:parseInt(m[6],10)||0, mount:m[7]});
+      }
+    });
+    return rows;
+  }
+
+  function renderDf(rows){
+    const tb = document.getElementById('lsi-disk');
+    tb.innerHTML = rows.map(r=>`<tr class="${r.usep>=80?'bad':''}"><td>${r.fs}</td><td>${r.type}</td><td>${r.size}</td><td>${r.used}</td><td>${r.avail}</td><td>${r.usep}%</td><td>${r.mount}</td></tr>`).join('');
+  }
+
+  function parsePs(text){
+    // Supports: pid ppid cmd %mem %cpu (cmd may contain spaces)
+    const out=[];
+    (text||'').split(/\n/).forEach(line=>{
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*?)\s+([0-9.]+)\s+([0-9.]+)$/);
+      if(m){ out.push({pid:m[1], cmd:m[3], mem:parseFloat(m[4])||0, cpu:parseFloat(m[5])||0}); }
+    });
+    return out;
+  }
+
+  function renderPs(rows, tbodyId){
+    const f = document.getElementById(tbodyId.replace('lsi-proc','').toLowerCase().includes('mem')? 'memFilter':'cpuFilter');
+    const term = (f&&f.value||'').toLowerCase();
+    const tb = document.getElementById(tbodyId);
+    tb.innerHTML = rows
+      .filter(r=>!term || r.cmd.toLowerCase().includes(term))
+      .map(r=>`<tr><td style="width:70px;">${r.pid}</td><td title="${r.cmd}"><span class="truncate">${r.cmd}</span></td><td style="width:80px;">${r.mem}</td><td style="width:80px;">${r.cpu}</td></tr>`)
+      .join('');
+  }
+
+  function parseServices(text){
+    const rows = [];
+    (text||'').split(/\n/).forEach(line=>{
+      if(/^\s*UNIT\b/i.test(line)) return; // skip header row from systemctl output
+      const m = line.match(/^(\S+)\s+loaded\s+(\S+)\s+(\S+)\s+(\S+)/i);
+      if(m){
+        rows.push({name:m[1], loaded:m[2], active:m[3], state:m[4]});
+      } else if(line.trim()) {
+        // Fallback: try split tokens
+        const parts = line.trim().split(/\s+/);
+        rows.push({name:parts[0]||'', loaded:parts[1]||'', active:parts[2]||'', state:parts[3]||''});
+      }
+    });
+    return rows;
+  }
+
+  function renderServices(rows){
+    const term = (document.getElementById('svcFilter').value||'').toLowerCase();
+    const tb = document.getElementById('lsi-services');
+    tb.innerHTML = rows.filter(r=>!term || r.name.toLowerCase().includes(term))
+      .map(r=>`<tr><td>${r.name}</td><td>${r.loaded}</td><td>${r.active}</td><td>${r.state}</td></tr>`).join('');
+  }
+
+  function renderIdentity(d){
+    const rows = [];
+    rows.push(kvRow('Date/Time', d.date_time));
+    rows.push(kvRow('Hostname', d.hostname));
+    rows.push(kvRow('Kernel', d.kernel_version));
+    rows.push(kvRow('Architecture', d.architecture));
+    document.getElementById('lsi-identity').innerHTML = rows.join('');
+  }
+
+  function renderSystem(d){
+    const rows = [];
+    rows.push(kvRow('OS Info', d.os_info));
+    rows.push(kvRow('Uptime', d.uptime));
+    // Memory warning if usage >80% (best effort parse of "used/total")
+    let memLine = d.memory_usage||'';
+    let memWarn = '';
+    const m = memLine.match(/\b(\d+)\s+(\d+)\s+(\d+)/); // naive numbers: total used free
+    if(m){
+      const total = parseFloat(m[1]); const used = parseFloat(m[2]);
+      if(total>0){ const pct = Math.round((used/total)*100); memWarn = pct>=80?` <span class='badge badge-danger'>${pct}%</span>`:` <span class='badge badge-success'>${pct}%</span>`; }
+    }
+    rows.push(kvRow('Memory Usage', memLine + memWarn));
+    document.getElementById('lsi-system').innerHTML = rows.join('');
+  }
+
+  async function loadLsi(){
+    try{
+      const res = await fetch(`/api/linux-system-info?server_id=${lsi.serverId}`, {credentials:'same-origin'});
+      if(!res.ok){ setUpdated('-'); return; }
+      const j = await res.json();
+      if(!j.exists){ setUpdated('-'); return; }
+      setUpdated(j.created_at);
+      const d = j.data || {};
+      renderIdentity(d);
+      renderSystem(d);
+      renderDf(parseDf(d.disk_usage||''));
+      // Store raw process text for filtering/sorting
+      document.getElementById('lsi-proc-mem').dataset.raw = d.top_memory_processes||'';
+      document.getElementById('lsi-proc-cpu').dataset.raw = d.top_cpu_processes||'';
+      renderPs(parsePs(d.top_memory_processes||''), 'lsi-proc-mem');
+      renderPs(parsePs(d.top_cpu_processes||''), 'lsi-proc-cpu');
+      document.getElementById('lsi-net').textContent = d.network_interfaces||'';
+      document.getElementById('lsi-ports').textContent = d.listening_ports||'';
+      document.getElementById('lsi-users').textContent = d.logged_in_users||'';
+      document.getElementById('lsi-mounts').textContent = d.mounted_filesystems||'';
+      document.getElementById('lsi-logs').textContent = d.system_logs||'';
+      // Services
+      const svcRows = parseServices(d.running_services||'');
+      document.getElementById('lsi-services').dataset.raw = d.running_services||'';
+      renderServices(svcRows);
+    }catch(e){ setUpdated('-'); }
+  }
+
+  // Event handlers for filters/sorts
+  document.getElementById('memFilter').addEventListener('input', ()=>{
+    renderPs(parsePs(document.getElementById('lsi-proc-mem').dataset.raw||''), 'lsi-proc-mem');
+  });
+  document.getElementById('cpuFilter').addEventListener('input', ()=>{
+    renderPs(parsePs(document.getElementById('lsi-proc-cpu').dataset.raw||''), 'lsi-proc-cpu');
+  });
+  document.getElementById('memSortCpu').addEventListener('click', ()=>{
+    const rows = parsePs(document.getElementById('lsi-proc-mem').dataset.raw||'').sort((a,b)=>b.cpu-a.cpu);
+    renderPs(rows, 'lsi-proc-mem');
+  });
+  document.getElementById('memSortMem').addEventListener('click', ()=>{
+    const rows = parsePs(document.getElementById('lsi-proc-mem').dataset.raw||'').sort((a,b)=>b.mem-a.mem);
+    renderPs(rows, 'lsi-proc-mem');
+  });
+  document.getElementById('cpuSortCpu').addEventListener('click', ()=>{
+    const rows = parsePs(document.getElementById('lsi-proc-cpu').dataset.raw||'').sort((a,b)=>b.cpu-a.cpu);
+    renderPs(rows, 'lsi-proc-cpu');
+  });
+  document.getElementById('cpuSortMem').addEventListener('click', ()=>{
+    const rows = parsePs(document.getElementById('lsi-proc-cpu').dataset.raw||'').sort((a,b)=>b.mem-a.mem);
+    renderPs(rows, 'lsi-proc-cpu');
+  });
+  document.getElementById('svcFilter').addEventListener('input', ()=>{
+    const rows = parseServices(document.getElementById('lsi-services').dataset.raw||'');
+    renderServices(rows);
+  });
+  document.getElementById('lsiRefreshBtn').addEventListener('click', loadLsi);
+
+  // initial load + auto-refresh every 3 minutes
+  loadLsi();
+  setInterval(()=>{
+    const cb = document.getElementById('lsiAutoRefreshCbx');
+    if(cb && cb.checked){ loadLsi(); }
+  }, 180000);
 })();
 </script>
 </body>
