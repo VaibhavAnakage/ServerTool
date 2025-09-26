@@ -17,8 +17,6 @@
             <li><a href="/">Dashboard</a></li>
             <li><a href="/domain">Domain Monitoring</a></li>
             <li><a href="/server">Server Info</a></li>
-            <li><a href="/server/history">Server History</a></li>
-            <li><a href="/run_alerts">Run Alerts</a></li>
             {% if user and (user.role or '').lower() == 'super_admin' %}
                 <li><a href="/users">Users</a></li>
             {% endif %}

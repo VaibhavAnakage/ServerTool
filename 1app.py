@@ -2,8 +2,313 @@ from flask import Flask, render_template, request, redirect, url_for, flash, ses
 import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback, threading, time, collections
 from email.message import EmailMessage
 
-app = Flask(__name__)
-app.secret_key = "replace-with-your-secret"  # for flash messages
+# Initialize Flask app early so decorators below have a defined app
+try:
+    app
+except NameError:
+    app = Flask(__name__)
+    app.secret_key = os.environ.get('APP_SECRET', 'replace-with-your-secret')
+
+# Ensure DB_FILE is available early for network helpers
+DB_FILE = os.environ.get('MONITORING_DB_PATH', 'monitoring.db')
+
+def net_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# Provide get_db_connection early for modules that expect it
+def get_db_connection():
+    return net_db()
+
+# ================= Network Monitoring =================
+def ensure_network_schema():
+    # Open DB directly to avoid ordering issues before get_db_connection/DB_FILE are defined
+    conn = net_db()
+    c = conn.cursor()
+    c.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS network_device (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT UNIQUE NOT NULL,
+            mac TEXT,
+            manufacturer TEXT,
+            added_at TEXT,
+            enabled INTEGER DEFAULT 1,
+            last_status TEXT,
+            last_rtt_ms REAL,
+            last_change_at TEXT,
+            notes TEXT
+        );
+        CREATE TABLE IF NOT EXISTS network_check (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT,
+            detail_text TEXT,
+            created_at TEXT,
+            FOREIGN KEY(device_id) REFERENCES network_device(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS network_alert (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id INTEGER NOT NULL,
+            kind TEXT,
+            severity TEXT,
+            message TEXT,
+            created_at TEXT,
+            sent_email INTEGER DEFAULT 0,
+            FOREIGN KEY(device_id) REFERENCES network_device(id) ON DELETE CASCADE
+        );
+        """
+    )
+    # Add device_type column if not exists
+    try:
+        c.execute("ALTER TABLE network_device ADD COLUMN device_type TEXT")
+    except Exception:
+        pass
+    conn.commit(); conn.close()
+
+ensure_network_schema()
+
+def _run_cmd(cmd, timeout=20):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return out.returncode, out.stdout.strip(), out.stderr.strip()
+    except Exception as e:
+        return -1, "", str(e)
+
+def _ping_ip(ip: str, count: int = 4):
+    # Windows ping: -n, Linux: -c
+    count_flag = '-n' if platform.system().lower().startswith('win') else '-c'
+    rc, out, err = _run_cmd(['ping', count_flag, str(max(1, count)), ip], timeout=15)
+    status = 'Alive' if rc == 0 else 'Down'
+    # Try parse average RTT from output
+    rtt = None
+    for line in out.splitlines():
+        if 'Average' in line or 'avg' in line.lower():
+            # Windows: Average = 12ms; Linux: rtt min/avg/max
+            # Try extract number before 'ms'
+            import re
+            m = re.search(r"(Average|avg)[^0-9]*([0-9]+\.?[0-9]*)\s*ms", line, re.I)
+            if not m:
+                m = re.search(r"=\s*([0-9\.]+)/([0-9\.]+)/", line)  # linux avg is group(2)
+                if m:
+                    try:
+                        rtt = float(m.group(2))
+                    except: pass
+            else:
+                try:
+                    rtt = float(m.group(2))
+                except: pass
+    return status, rtt, (out or err)
+
+def _traceroute(ip: str):
+    cmd = ['tracert', ip] if platform.system().lower().startswith('win') else ['traceroute', ip]
+    return _run_cmd(cmd, timeout=60)
+
+def _nmap_scan(ip: str):
+    return _run_cmd(['nmap', '-sS', '-sV', ip], timeout=90)
+
+def _nmap_os(ip: str):
+    return _run_cmd(['nmap', '-O', ip], timeout=90)
+
+def _curl_headers(ip: str):
+    return _run_cmd(['curl', '-I', f'http://{ip}'], timeout=20)
+
+def _openssl_tls(ip: str):
+    return _run_cmd(['openssl', 's_client', '-connect', f'{ip}:443', '-servername', ip], timeout=20)
+
+def _snmp_walk(ip: str, community: str):
+    return _run_cmd(['snmpwalk', '-v2c', '-c', community, ip], timeout=60)
+
+def _resolve_mac_and_vendor(ip: str):
+    # Best-effort ARP
+    rc, out, err = _run_cmd(['arp', '-a', ip], timeout=10)
+    mac = None
+    if out:
+        import re
+        m = re.search(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", out)
+        if m:
+            mac = m.group(0)
+    vendor = None
+    # If we have a MAC, try macvendors API via curl
+    if mac:
+        rc2, out2, err2 = _run_cmd(['curl', '-s', f'https://api.macvendors.com/{mac}'], timeout=10)
+        if rc2 == 0 and out2:
+            vendor = out2.strip()[:200]
+    return mac, vendor
+
+def _network_alert(conn, device_id: int, message: str, severity='critical', kind='status'):
+    c = conn.cursor()
+    now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+    c.execute("INSERT INTO network_alert(device_id,kind,severity,message,created_at) VALUES(?,?,?,?,?)",
+              (device_id, kind, severity, message, now))
+    conn.commit()
+    # Optionally send email if SMTP configured
+    try:
+        send_simple_email(f"Network Alert: Device {device_id}", message)
+        c.execute("UPDATE network_alert SET sent_email=1 WHERE id = last_insert_rowid()")
+        conn.commit()
+    except Exception:
+        pass
+
+def send_simple_email(subject: str, body: str):
+    # Minimal helper using SMTP config placeholders if set
+    smtp_host = os.environ.get('SMTP_HOST')
+    smtp_user = os.environ.get('SMTP_USER')
+    smtp_pass = os.environ.get('SMTP_PASS')
+    to_addr = os.environ.get('ALERT_EMAIL_TO')
+    if not (smtp_host and smtp_user and smtp_pass and to_addr):
+        return
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = smtp_user
+    msg['To'] = to_addr
+    msg.set_content(body)
+    with smtplib.SMTP(smtp_host) as s:
+        s.starttls()
+        s.login(smtp_user, smtp_pass)
+        s.send_message(msg)
+
+# Background monitor: ping devices every 60s
+def _network_monitor_loop():
+    while True:
+        try:
+            conn = net_db(); c = conn.cursor()
+            c.execute("SELECT id, ip, enabled, last_status, last_rtt_ms, mac, manufacturer FROM network_device WHERE enabled=1")
+            for did, ip, enabled, last_status, last_rtt, mac, manufacturer in c.fetchall():
+                status, rtt, detail = _ping_ip(ip, count=1)
+                now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+                c.execute("INSERT INTO network_check(device_id,kind,status,detail_text,created_at) VALUES(?,?,?,?,?)",
+                          (did, 'ping', status, detail, now))
+                # Detect changes
+                if last_status != status:
+                    _network_alert(conn, did, f"Device {ip} changed status: {last_status} -> {status}")
+                    c.execute("UPDATE network_device SET last_status=?, last_rtt_ms=?, last_change_at=? WHERE id=?",
+                              (status, rtt, now, did))
+                else:
+                    c.execute("UPDATE network_device SET last_status=?, last_rtt_ms=? WHERE id=?",
+                              (status, rtt, did))
+                # Enrich missing MAC/vendor opportunistically
+                if not mac or not manufacturer:
+                    new_mac, new_vendor = _resolve_mac_and_vendor(ip)
+                    if new_mac or new_vendor:
+                        c.execute("UPDATE network_device SET mac=COALESCE(?, mac), manufacturer=COALESCE(?, manufacturer) WHERE id=?",
+                                  (new_mac, new_vendor, did))
+            conn.commit(); conn.close()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(8)
+
+# Start monitor thread
+try:
+    t = threading.Thread(target=_network_monitor_loop, daemon=True)
+    t.start()
+except Exception:
+    pass
+
+@app.route('/network')
+def network_page():
+    user = get_current_user()
+    return render_template('network.html', user=user)
+
+@app.route('/api/network/devices', methods=['GET', 'POST'])
+def api_network_devices():
+    if request.method == 'POST':
+        ip = request.form.get('ip') or (request.json and request.json.get('ip'))
+        device_type = request.form.get('device_type') or (request.json and request.json.get('device_type'))
+        if not ip:
+            return jsonify({"error": "ip required"}), 400
+        mac, vendor = _resolve_mac_and_vendor(ip)
+        now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+        conn = get_db_connection(); c = conn.cursor()
+        try:
+            c.execute("INSERT INTO network_device(ip, mac, manufacturer, added_at, enabled, device_type) VALUES(?,?,?,?,1,?)",
+                      (ip, mac, vendor, now, device_type))
+            conn.commit()
+            return jsonify({"ok": True}), 201
+        except sqlite3.IntegrityError:
+            return jsonify({"ok": True, "note": "already exists"})
+        finally:
+            conn.close()
+    # GET list
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT id, ip, mac, manufacturer, device_type, enabled, last_status, last_rtt_ms, last_change_at FROM network_device ORDER BY ip")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return jsonify({"devices": rows})
+
+@app.route('/api/network/device/<int:device_id>/checks')
+def api_network_device_checks(device_id: int):
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT kind, status, created_at FROM network_check WHERE device_id=? ORDER BY created_at DESC LIMIT 50", (device_id,))
+    out = [dict(r) for r in c.fetchall()]
+    conn.close(); return jsonify({"checks": out})
+
+@app.route('/api/network/device/<int:device_id>/action', methods=['POST'])
+def api_network_device_action(device_id: int):
+    action = request.form.get('action') or (request.json and request.json.get('action'))
+    community = request.form.get('community') or (request.json and request.json.get('community')) or 'public'
+    if not action:
+        return jsonify({"error": "action required"}), 400
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT ip FROM network_device WHERE id=?", (device_id,))
+    row = c.fetchone(); conn.close()
+    if not row:
+        return jsonify({"error": "device not found"}), 404
+    ip = row[0]
+    # Dispatch
+    if action == 'ping':
+        status, rtt, detail = _ping_ip(ip)
+        return jsonify({"action": action, "status": status, "rtt_ms": rtt, "output": detail})
+    if action == 'traceroute':
+        rc, out, err = _traceroute(ip); return jsonify({"action": action, "rc": rc, "output": out or err})
+    if action == 'nmap':
+        rc, out, err = _nmap_scan(ip); return jsonify({"action": action, "rc": rc, "output": out or err})
+    if action == 'os_fingerprint':
+        rc, out, err = _nmap_os(ip); return jsonify({"action": action, "rc": rc, "output": out or err})
+    if action == 'http_headers':
+        rc, out, err = _curl_headers(ip); return jsonify({"action": action, "rc": rc, "output": out or err})
+    if action == 'tls_info':
+        rc, out, err = _openssl_tls(ip); return jsonify({"action": action, "rc": rc, "output": out or err})
+    if action == 'snmp':
+        rc, out, err = _snmp_walk(ip, community); return jsonify({"action": action, "rc": rc, "output": out or err})
+    if action == 'resolve_vendor':
+        new_mac, new_vendor = _resolve_mac_and_vendor(ip)
+        conn = get_db_connection(); c = conn.cursor()
+        if new_mac or new_vendor:
+            c.execute("UPDATE network_device SET mac=COALESCE(?, mac), manufacturer=COALESCE(?, manufacturer) WHERE id=?",
+                      (new_mac, new_vendor, device_id))
+            conn.commit()
+        c.execute("SELECT mac, manufacturer FROM network_device WHERE id=?", (device_id,))
+        row = c.fetchone(); conn.close()
+        return jsonify({"action": action, "mac": row[0] if row else new_mac, "manufacturer": row[1] if row else new_vendor})
+    return jsonify({"error": "unknown action"}), 400
+
+@app.route('/api/network/alerts')
+def api_network_alerts():
+    limit = max(1, min(200, request.args.get('limit', type=int) or 50))
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute(
+        """
+        SELECT a.created_at, d.ip, a.severity, a.message
+        FROM network_alert a
+        JOIN network_device d ON d.id = a.device_id
+        ORDER BY a.created_at DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close();
+    return jsonify({"alerts": rows})
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+import ssl, socket, datetime, whois, platform, psutil, sqlite3, smtplib, subprocess, functools, os, traceback, threading, time, collections
+from email.message import EmailMessage
+
+# app was initialized earlier to avoid decorator NameError; do not re-initialize here
+# app = Flask(__name__)
+# app.secret_key = "replace-with-your-secret"  # for flash messages
 DB_FILE = os.environ.get('MONITORING_DB_PATH', 'monitoring.db')
 ACTIVE_PING_ENABLED = os.environ.get('ACTIVE_PING_ENABLED', '0') == '1'
 GLOBAL_INGEST_LOCK = threading.Lock()

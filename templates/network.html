@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Network Monitoring</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    :root { --border:#e5e7eb; --muted:#6b7280; --mono: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; }
+    body { background:#f8fafc; }
+    .container{ width:min(1200px,94%); margin:16px auto; }
+    .main { width:min(1200px,94%); margin:0 auto; padding-top:28px; }
+    .card{ background:#fff; border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:16px; }
+    .controls{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .grid{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:16px; }
+    @media (max-width:900px){ .grid{ grid-template-columns:1fr; } }
+    .table-wrap{ border:1px solid var(--border); border-radius:8px; overflow:auto; background:#fff; }
+    table{ width:100%; border-collapse:collapse; font-size:13px; }
+    thead th{ text-align:left; padding:8px; background:#f1f5f9; border-bottom:1px solid var(--border); white-space:nowrap; color:#111827; font-weight:600; }
+    tbody td{ padding:8px; border-bottom:1px solid var(--border); white-space:nowrap; vertical-align:top; }
+    .muted{ color:var(--muted); }
+    .mono{ font-family:var(--mono); white-space:pre-wrap; }
+    .btn-row{ display:flex; gap:6px; flex-wrap:wrap; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:9999px; font-size:12px; }
+    .ok { background:#dcfce7; color:#166534; }
+    .bad { background:#fee2e2; color:#991b1b; }
+    header .container, nav .container { width:min(1200px,94%); }
+    nav ul { display:flex; flex-direction:row; gap:12px; list-style:none; padding:8px 0; margin:0; align-items:center; }
+    nav a { text-decoration:none; color:#111827; }
+    nav a.active { font-weight:600; color:#1e40af; }
+    /* Selection + disabled actions */
+    tr.selected { background:#eef2ff; }
+    .actions-toolbar button[disabled] { opacity:0.5; cursor:not-allowed; }
+    .error { color:#991b1b; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>Network Monitoring</h1>
+    </div>
+  </header>
+
+  <div class="container">
+    <div class="card">
+      <h2>Device Management</h2>
+      <div class="controls">
+        <label for="device-ip"><strong>Enter Device IP Address:</strong></label>
+        <input type="text" id="device-ip" name="device-ip" class="form-control" placeholder="192.168.1.10" style="min-width:200px;">
+        <label for="device-type"><strong>Type:</strong></label>
+        <select id="device-type" class="form-control" style="min-width:180px;">
+          <option value="">Select type</option>
+          <option>Router</option>
+          <option>Switch</option>
+          <option>Firewall</option>
+          <option>Access Point</option>
+          <option>Server</option>
+          <option>Printer</option>
+          <option>IP Camera</option>
+          <option>NAS</option>
+          <option>Other</option>
+        </select>
+        <button id="add-device" class="btn btn-primary">Add Device</button>
+        <span id="add-note" class="muted"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Devices</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>IP</th>
+              <th>MAC</th>
+              <th>Manufacturer</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>RTT (ms)</th>
+              <th>Last Change</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="devices-body"></tbody>
+        </table>
+      </div>
+      <div class="muted" id="devices-note"></div>
+    </div>
+
+    <div class="grid">
+      <div class="card" style="box-shadow:0 1px 2px rgba(0,0,0,0.04);">
+        <h2>Results</h2>
+        <div class="btn-row actions-toolbar" style="margin-bottom:6px;">
+          <button class="btn btn-secondary" data-act="ping" disabled>Ping</button>
+          <button class="btn btn-secondary" data-act="traceroute" disabled>Traceroute</button>
+          <button class="btn btn-secondary" data-act="nmap" disabled>Scan Open Ports</button>
+          <button class="btn btn-secondary" data-act="os_fingerprint" disabled>Fingerprint OS</button>
+          <button class="btn btn-secondary" data-act="http_headers" disabled>HTTP Headers</button>
+          <button class="btn btn-secondary" data-act="tls_info" disabled>TLS Info</button>
+          <button class="btn btn-secondary" data-act="snmp" disabled>SNMP Walk</button>
+          <input type="text" id="snmp-community" class="form-control" placeholder="SNMP community (default: public)" style="min-width:200px;">
+        </div>
+        <div class="muted" id="result-note">Select a device row and click an action.</div>
+        <pre id="result-output" class="mono" style="max-height:50vh; overflow:auto;"></pre>
+      </div>
+      <div class="card">
+        <h2>Recent Alerts</h2>
+        <div class="table-wrap" style="box-shadow:0 1px 2px rgba(0,0,0,0.04);">
+          <table>
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>IP</th>
+                <th>Severity</th>
+                <th>Message</th>
+              </tr>
+            </thead>
+            <tbody id="alerts-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  let selectedDeviceId = null;
+  let selectedIP = '';
+
+  function h(x){ return x==null?'-':x; }
+
+  function validateIP(value){
+    // simple IPv4 validation
+    const re = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+    return re.test(value);
+  }
+
+  async function listDevices(){
+    const res = await fetch('/api/network/devices', {credentials:'same-origin'});
+    if(!res.ok){ document.getElementById('devices-note').textContent = 'Failed to load devices.'; return; }
+    const data = await res.json();
+    const tb = document.getElementById('devices-body');
+    tb.innerHTML = '';
+    const items = data.devices||[];
+    if(items.length === 0){
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="8" class="muted">No devices yet. Add your first device above.</td>';
+      tb.appendChild(tr);
+      return;
+    }
+    items.forEach(d => {
+      const tr = document.createElement('tr');
+      tr.dataset.id = d.id;
+      tr.innerHTML = `
+        <td>${h(d.ip)}</td>
+        <td>${h(d.mac)}</td>
+        <td>${h(d.manufacturer)}</td>
+        <td>${h(d.device_type)}</td>
+        <td>${d.last_status ? `<span class="pill ${d.last_status==='Alive'?'ok':'bad'}">${d.last_status}</span>` : '-'}</td>
+        <td>${d.last_rtt_ms==null?'-':d.last_rtt_ms}</td>
+        <td>${h(d.last_change_at)}</td>
+        <td class="btn-row">
+          <button class="btn btn-sm btn-secondary act" data-act="ping">Ping</button>
+          <button class="btn btn-sm btn-secondary act" data-act="traceroute">Traceroute</button>
+          <button class="btn btn-sm btn-secondary act" data-act="nmap">Ports</button>
+          <button class="btn btn-sm btn-secondary act" data-act="os_fingerprint">OS</button>
+          <button class="btn btn-sm btn-secondary act" data-act="http_headers">HTTP</button>
+          <button class="btn btn-sm btn-secondary act" data-act="tls_info">TLS</button>
+          <button class="btn btn-sm btn-secondary act" data-act="snmp">SNMP</button>
+        </td>`;
+      tr.addEventListener('click', () => {
+        selectedDeviceId = d.id; selectedIP = d.ip;
+        document.getElementById('result-note').textContent = `Selected ${d.ip}`;
+        document.querySelectorAll('#devices-body tr').forEach(r=>r.classList.remove('selected'));
+        tr.classList.add('selected');
+        document.querySelectorAll('.actions-toolbar button').forEach(b => b.disabled = false);
+      });
+      tb.appendChild(tr);
+    });
+  }
+
+  async function addDevice(){
+    const ip = document.getElementById('device-ip').value.trim();
+    const dtype = document.getElementById('device-type').value;
+    const note = document.getElementById('add-note');
+    if(!ip){ note.textContent = 'Enter an IP.'; return; }
+    if(!validateIP(ip)) { note.textContent = 'Enter a valid IPv4 address.'; return; }
+    note.textContent = 'Adding...';
+    const fd = new FormData(); fd.append('ip', ip); if(dtype) fd.append('device_type', dtype);
+    const res = await fetch('/api/network/devices', {method:'POST', credentials:'same-origin', body: fd});
+    if(res.ok){ note.textContent = 'Added.'; document.getElementById('device-ip').value=''; listDevices(); }
+    else { note.textContent = 'Failed.'; }
+  }
+
+  async function runAction(act){
+    if(!selectedDeviceId){ document.getElementById('result-note').textContent = 'Select a device first.'; return; }
+    document.getElementById('result-note').textContent = `Running ${act} on ${selectedIP}...`;
+    const body = { action: act };
+    if(act==='snmp'){
+      const comm = document.getElementById('snmp-community').value.trim();
+      if(comm) body.community = comm;
+    }
+    const res = await fetch(`/api/network/device/${selectedDeviceId}/action`, {method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const data = await res.json();
+    document.getElementById('result-output').textContent = (data.output || JSON.stringify(data, null, 2) || '').slice(0, 200000);
+    document.getElementById('result-note').textContent = `Done ${act}.`;
+  }
+
+  async function listAlerts(){
+    const res = await fetch('/api/network/alerts?limit=50', {credentials:'same-origin'});
+    if(!res.ok) return;
+    const data = await res.json();
+    const tbody = document.getElementById('alerts-body');
+    const items = data.alerts || [];
+    tbody.innerHTML = items.map(a => `
+      <tr>
+        <td>${h(a.created_at)}</td>
+        <td>${h(a.ip)}</td>
+        <td>${h(a.severity)}</td>
+        <td>${h(a.message)}</td>
+      </tr>
+    `).join('');
+  }
+
+  // Event bindings
+  document.getElementById('add-device').addEventListener('click', addDevice);
+  document.querySelectorAll('.btn-row button[data-act]').forEach(b => {
+    b.addEventListener('click', () => runAction(b.dataset.act));
+  });
+  document.addEventListener('click', function(ev){
+    const btn = ev.target.closest('.act');
+    if(!btn) return;
+    runAction(btn.dataset.act);
+  });
+
+  // Initial load & refreshers
+  listDevices();
+  listAlerts();
+  setInterval(listDevices, 8000);
+  setInterval(listAlerts, 30000);
+})();
+</script>
+</body>
+</html>
